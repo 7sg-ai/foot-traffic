@@ -27,51 +27,85 @@ from shared.models import IntervalAggregate
 
 logger = logging.getLogger(__name__)
 
+_run_log: list[str] = []
+
+
+def _log(msg: str) -> None:
+    """Log to both the standard logger and an in-memory list for blob upload."""
+    logger.info(msg)
+    _run_log.append(msg)
+
+
+def _flush_log_to_blob(settings) -> None:
+    """Upload the run log to blob storage so we can read it externally."""
+    try:
+        from azure.storage.blob import BlobServiceClient
+        client = BlobServiceClient.from_connection_string(settings.storage_connection_string)
+        content = "\n".join(_run_log)
+        blob = client.get_blob_client("video-frames", "scheduler-run.log")
+        blob.upload_blob(content.encode(), overwrite=True)
+    except Exception as e:
+        logger.error("Failed to flush log to blob: %s", e)
+
 
 def main(mytimer: func.TimerRequest) -> None:
     """
     Timer trigger: runs every 5 minutes (cron: 0 */5 * * * *).
-    
-    For each active video feed:
-    1. Captures frames from the public video stream
-    2. Sends frames to VLM for demographic analysis
-    3. Aggregates results into 5-minute intervals
-    4. Stores aggregates in Synapse Analytics
     """
+    _run_log.clear()
     utc_now = datetime.now(timezone.utc)
-    
-    # Calculate the current 5-minute interval bucket
     interval_start = _floor_to_5min(utc_now)
     interval_end = interval_start + timedelta(minutes=5)
 
     if mytimer.past_due:
-        logger.warning("Timer is past due! Running at %s", utc_now.isoformat())
+        _log(f"WARN: Timer is past due! Running at {utc_now.isoformat()}")
 
-    logger.info(
-        "Video scheduler triggered at %s | interval: %s -> %s",
-        utc_now.isoformat(),
-        interval_start.isoformat(),
-        interval_end.isoformat(),
-    )
+    _log(f"START: scheduler triggered at {utc_now.isoformat()} interval={interval_start.isoformat()}")
 
-    settings = get_settings()
-    db = get_db_client()
-    capturer = get_video_capture()
-    analyzer = get_vlm_analyzer()
+    try:
+        settings = get_settings()
+        _log("OK: get_settings()")
+    except Exception as e:
+        _log(f"FAIL: get_settings(): {e}")
+        return
+
+    try:
+        db = get_db_client()
+        _log("OK: get_db_client()")
+    except Exception as e:
+        _log(f"FAIL: get_db_client(): {e}")
+        _flush_log_to_blob_raw(settings)
+        return
+
+    try:
+        capturer = get_video_capture()
+        _log("OK: get_video_capture()")
+    except Exception as e:
+        _log(f"FAIL: get_video_capture(): {e}")
+        _flush_log_to_blob_raw(settings)
+        return
+
+    try:
+        analyzer = get_vlm_analyzer()
+        _log("OK: get_vlm_analyzer()")
+    except Exception as e:
+        _log(f"FAIL: get_vlm_analyzer(): {e}")
+        _flush_log_to_blob_raw(settings)
+        return
 
     # Get active feeds from database
     try:
         feeds = db.get_active_feeds()
+        _log(f"OK: db.get_active_feeds() returned {len(feeds)} feeds")
     except Exception as e:
-        logger.error("Failed to fetch active feeds from Synapse: %s", e)
-        # Fall back to environment variable feeds
+        _log(f"WARN: db.get_active_feeds() failed: {e} — falling back to env var feeds")
         feeds = _get_feeds_from_env(settings)
+        _log(f"INFO: env var feeds: {len(feeds)} feeds")
 
     if not feeds:
-        logger.warning("No active video feeds configured. Skipping analysis.")
+        _log("WARN: No active video feeds configured. Skipping analysis.")
+        _flush_log_to_blob_raw(settings)
         return
-
-    logger.info("Processing %d active video feeds", len(feeds))
 
     total_persons = 0
     total_frames = 0
@@ -80,61 +114,57 @@ def main(mytimer: func.TimerRequest) -> None:
     for feed in feeds:
         job_id = str(uuid.uuid4())
         job_start = time.time()
-
-        logger.info(
-            "Processing feed: %s (%s) | job_id=%s",
-            feed.feed_name,
-            feed.feed_url,
-            job_id,
-        )
+        _log(f"INFO: Processing feed_id={feed.feed_id} name={feed.feed_name} url={feed.feed_url}")
 
         try:
-            # Step 1: Capture frames from the video stream
+            # Step 1: Capture frames
+            _log(f"INFO: Starting capture_frames for feed_id={feed.feed_id}")
             frames = capturer.capture_frames(
                 feed_url=feed.feed_url,
                 feed_id=feed.feed_id,
                 interval_start=interval_start,
                 num_frames=settings.frames_per_interval,
-                # 10 s sleep between frames: 5 frames × 10 s = ~50 s total capture
-                # time, well within the 10-min function timeout.  The old value of
-                # 60 s caused the function to burn through thousands of cap.grab()
-                # calls trying to skip video, which timed out on live HLS streams.
                 frame_interval_seconds=10.0,
             )
-
+            _log(f"INFO: capture_frames returned {len(frames)} frames for feed_id={feed.feed_id}")
             total_frames += len(frames)
 
             if not frames:
-                logger.warning(
-                    "No frames captured for feed_id=%d (%s)",
-                    feed.feed_id,
-                    feed.feed_name,
-                )
-                db.log_analysis_job(
-                    job_id=job_id,
-                    feed_id=feed.feed_id,
-                    interval_start=interval_start,
-                    status="failed",
-                    frames_captured=0,
-                    error_message="No frames captured from stream",
-                    duration_seconds=time.time() - job_start,
-                )
+                _log(f"WARN: No frames captured for feed_id={feed.feed_id}")
+                try:
+                    db.log_analysis_job(
+                        job_id=job_id,
+                        feed_id=feed.feed_id,
+                        interval_start=interval_start,
+                        status="failed",
+                        frames_captured=0,
+                        error_message="No frames captured from stream",
+                        duration_seconds=time.time() - job_start,
+                    )
+                except Exception as dbe:
+                    _log(f"WARN: db.log_analysis_job failed: {dbe}")
+                _flush_log_to_blob_raw(settings)
                 continue
 
             # Step 2: Analyze frames with VLM
+            _log(f"INFO: Starting VLM analysis for {len(frames)} frames")
             frame_results = analyzer.analyze_multiple_frames(
                 frames=frames,
                 feed_id=feed.feed_id,
                 feed_url=feed.feed_url,
                 interval_start=interval_start,
             )
+            _log(f"INFO: VLM analysis complete: {len(frame_results)} results")
 
             # Step 3: Insert raw observations
             persons_in_interval = 0
             for frame_result in frame_results:
                 if not frame_result.error:
-                    obs_count = db.insert_raw_observations(frame_result)
-                    persons_in_interval += obs_count
+                    try:
+                        obs_count = db.insert_raw_observations(frame_result)
+                        persons_in_interval += obs_count
+                    except Exception as dbe:
+                        _log(f"WARN: insert_raw_observations failed: {dbe}")
 
             total_persons += persons_in_interval
 
@@ -145,58 +175,64 @@ def main(mytimer: func.TimerRequest) -> None:
                 interval_end=interval_end,
                 frame_results=frame_results,
             )
-
-            db.insert_interval_aggregate(aggregate)
+            try:
+                db.insert_interval_aggregate(aggregate)
+                _log(f"OK: insert_interval_aggregate feed_id={feed.feed_id} total={aggregate.total_count}")
+            except Exception as dbe:
+                _log(f"WARN: insert_interval_aggregate failed: {dbe}")
 
             # Step 5: Log job success
             job_duration = time.time() - job_start
             tokens_used = analyzer.total_tokens_used
             total_tokens = tokens_used
+            try:
+                db.log_analysis_job(
+                    job_id=job_id,
+                    feed_id=feed.feed_id,
+                    interval_start=interval_start,
+                    status="success",
+                    frames_captured=len(frames),
+                    persons_detected=persons_in_interval,
+                    vlm_calls_made=len(frames),
+                    total_tokens_used=tokens_used,
+                    duration_seconds=job_duration,
+                )
+            except Exception as dbe:
+                _log(f"WARN: log_analysis_job failed: {dbe}")
 
-            db.log_analysis_job(
-                job_id=job_id,
-                feed_id=feed.feed_id,
-                interval_start=interval_start,
-                status="success",
-                frames_captured=len(frames),
-                persons_detected=persons_in_interval,
-                vlm_calls_made=len(frames),
-                total_tokens_used=tokens_used,
-                duration_seconds=job_duration,
-            )
-
-            logger.info(
-                "Feed %s complete: frames=%d, persons=%d, tokens=%d, duration=%.1fs",
-                feed.feed_name,
-                len(frames),
-                persons_in_interval,
-                tokens_used,
-                job_duration,
-            )
+            _log(f"OK: feed_id={feed.feed_id} frames={len(frames)} persons={persons_in_interval} tokens={tokens_used} duration={job_duration:.1f}s")
 
         except Exception as e:
-            logger.exception(
-                "Failed to process feed_id=%d (%s): %s",
-                feed.feed_id,
-                feed.feed_name,
-                e,
-            )
-            db.log_analysis_job(
-                job_id=job_id,
-                feed_id=feed.feed_id,
-                interval_start=interval_start,
-                status="failed",
-                error_message=str(e)[:2000],
-                duration_seconds=time.time() - job_start,
-            )
+            import traceback
+            _log(f"FAIL: feed_id={feed.feed_id}: {traceback.format_exc()[:1000]}")
+            try:
+                db.log_analysis_job(
+                    job_id=job_id,
+                    feed_id=feed.feed_id,
+                    interval_start=interval_start,
+                    status="failed",
+                    error_message=str(e)[:2000],
+                    duration_seconds=time.time() - job_start,
+                )
+            except Exception:
+                pass
 
-    logger.info(
-        "Scheduler run complete: feeds=%d, frames=%d, persons=%d, tokens=%d",
-        len(feeds),
-        total_frames,
-        total_persons,
-        total_tokens,
-    )
+        _flush_log_to_blob_raw(settings)
+
+    _log(f"DONE: feeds={len(feeds)} frames={total_frames} persons={total_persons} tokens={total_tokens}")
+    _flush_log_to_blob_raw(settings)
+
+
+def _flush_log_to_blob_raw(settings) -> None:
+    """Upload the run log to blob storage."""
+    try:
+        from azure.storage.blob import BlobServiceClient
+        client = BlobServiceClient.from_connection_string(settings.storage_connection_string)
+        content = "\n".join(_run_log)
+        blob = client.get_blob_client("video-frames", "scheduler-run.log")
+        blob.upload_blob(content.encode(), overwrite=True)
+    except Exception as e:
+        logger.error("Failed to flush log to blob: %s", e)
 
 
 def _floor_to_5min(dt: datetime) -> datetime:

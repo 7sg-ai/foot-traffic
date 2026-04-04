@@ -149,13 +149,17 @@ class VideoCapture:
                     # the broadcast without any seek overhead.
                     time.sleep(frame_interval_seconds)
 
-                # Discard a few buffered frames so we get a fresh one from the
+                # Flush a few buffered frames so we get a fresh one from the
                 # live edge rather than something that has been sitting in the
                 # decoder buffer.
+                # IMPORTANT: use grab() + retrieve() together — never call
+                # cap.read() after cap.grab() because read() calls grab()
+                # internally, which double-advances the decoder and causes
+                # ret=False on live HLS/DASH streams.
                 for _ in range(3):
                     cap.grab()
 
-                ret, frame = cap.read()
+                ret, frame = cap.retrieve()
                 if not ret or frame is None:
                     logger.warning(
                         "Failed to read frame %d/%d from %s", i + 1, num_frames, feed_url

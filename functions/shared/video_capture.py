@@ -122,46 +122,60 @@ class VideoCapture:
             List of (jpeg_bytes, blob_url) tuples
         """
         frames = []
+        diag: list[str] = []
+
+        def _dlog(msg: str) -> None:
+            logger.info(msg)
+            diag.append(msg)
+
+        def _flush_diag() -> None:
+            try:
+                content = "\n".join(diag).encode()
+                blob = self._blob_client.get_blob_client(
+                    self._container, f"capture-diag-feed{feed_id}.log"
+                )
+                blob.upload_blob(content, overwrite=True)
+            except Exception:
+                pass
 
         try:
+            _dlog(f"capture_frames: resolving URL for feed_id={feed_id} url={feed_url}")
             stream_url = self._get_stream_url(feed_url)
-            logger.info("Resolved stream URL for %s: %s", feed_url, stream_url[:80] if stream_url else "None")
+            _dlog(f"capture_frames: resolved stream_url={stream_url[:120] if stream_url else 'None'}")
         except Exception as e:
-            import traceback
-            logger.error("Failed to resolve stream URL for %s: %s\n%s", feed_url, e, traceback.format_exc())
+            import traceback as _tb
+            _dlog(f"capture_frames: FAIL resolve URL: {e}\n{_tb.format_exc()[:800]}")
+            logger.error("Failed to resolve stream URL for %s: %s", feed_url, e)
+            _flush_diag()
             return frames
 
         cap = None
         try:
+            _dlog(f"capture_frames: opening cv2.VideoCapture({stream_url[:80]})")
             cap = cv2.VideoCapture(stream_url)
-            # Small buffer so we stay near the live edge
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-            if not cap.isOpened():
+            opened = cap.isOpened()
+            _dlog(f"capture_frames: cap.isOpened()={opened}")
+            if not opened:
                 logger.error("Could not open video stream: %s", feed_url)
+                _flush_diag()
                 return frames
 
             fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            _dlog(f"capture_frames: stream opened fps={fps:.1f}")
             logger.info("Stream opened: fps=%.1f, feed_id=%d", fps, feed_id)
 
             for i in range(num_frames):
                 if i > 0:
-                    # Sleep between frames instead of burning through grab() calls.
-                    # For live streams this naturally advances to a later moment in
-                    # the broadcast without any seek overhead.
                     time.sleep(frame_interval_seconds)
 
-                # Flush a few buffered frames so we get a fresh one from the
-                # live edge rather than something that has been sitting in the
-                # decoder buffer.
-                # IMPORTANT: use grab() + retrieve() together — never call
-                # cap.read() after cap.grab() because read() calls grab()
-                # internally, which double-advances the decoder and causes
-                # ret=False on live HLS/DASH streams.
+                # Flush buffer then retrieve — never call cap.read() after cap.grab()
                 for _ in range(3):
                     cap.grab()
 
                 ret, frame = cap.retrieve()
+                _dlog(f"capture_frames: frame {i+1}/{num_frames} ret={ret} frame_is_none={frame is None}")
                 if not ret or frame is None:
                     logger.warning(
                         "Failed to read frame %d/%d from %s", i + 1, num_frames, feed_url
@@ -186,15 +200,19 @@ class VideoCapture:
                 )
 
                 frames.append((jpeg_bytes, blob_url))
+                _dlog(f"capture_frames: captured frame {i+1}/{num_frames} size={len(jpeg_bytes)} blob={blob_url[:60]}")
                 logger.debug(
                     "Captured frame %d/%d for feed_id=%d", i + 1, num_frames, feed_id
                 )
 
         except Exception as e:
+            import traceback as _tb
+            _dlog(f"capture_frames: EXCEPTION: {e}\n{_tb.format_exc()[:800]}")
             logger.error("Frame capture error for feed_id=%d: %s", feed_id, e)
         finally:
             if cap is not None:
                 cap.release()
+            _flush_diag()
 
         logger.info(
             "Captured %d/%d frames for feed_id=%d interval=%s",

@@ -117,7 +117,20 @@ def main(mytimer: func.TimerRequest) -> None:
         _log(f"INFO: Processing feed_id={feed.feed_id} name={feed.feed_name} url={feed.feed_url}")
 
         try:
-            # Step 1: Capture frames
+            # Step 1: Capture frames — monkey-patch logger to capture errors into blob log
+            import logging as _logging
+            _orig_handlers = logger.handlers[:]
+
+            class _BlobLogHandler(_logging.Handler):
+                def emit(self, record):
+                    _run_log.append(f"[video_capture] {record.levelname}: {self.format(record)}")
+
+            _blob_handler = _BlobLogHandler()
+            vc_logger = _logging.getLogger("functions.shared.video_capture")
+            vc_logger.addHandler(_blob_handler)
+            shared_vc_logger = _logging.getLogger("shared.video_capture")
+            shared_vc_logger.addHandler(_blob_handler)
+
             _log(f"INFO: Starting capture_frames for feed_id={feed.feed_id}")
             frames = capturer.capture_frames(
                 feed_url=feed.feed_url,
@@ -126,6 +139,8 @@ def main(mytimer: func.TimerRequest) -> None:
                 num_frames=settings.frames_per_interval,
                 frame_interval_seconds=10.0,
             )
+            vc_logger.removeHandler(_blob_handler)
+            shared_vc_logger.removeHandler(_blob_handler)
             _log(f"INFO: capture_frames returned {len(frames)} frames for feed_id={feed.feed_id}")
             total_frames += len(frames)
 

@@ -125,8 +125,10 @@ class VideoCapture:
 
         try:
             stream_url = self._get_stream_url(feed_url)
+            logger.info("Resolved stream URL for %s: %s", feed_url, stream_url[:80] if stream_url else "None")
         except Exception as e:
-            logger.error("Failed to resolve stream URL for %s: %s", feed_url, e)
+            import traceback
+            logger.error("Failed to resolve stream URL for %s: %s\n%s", feed_url, e, traceback.format_exc())
             return frames
 
         cap = None

@@ -1,19 +1,27 @@
 """
 Video frame capture utility.
-Extracts frames from public video streams (YouTube live, RTSP, HLS, etc.)
-using yt-dlp + OpenCV.
+Extracts frames from public video streams.
+
+Supported source types
+----------------------
+* TfL JamCam  – short MP4 clips (~5-10 s) hosted on S3 and refreshed every
+                 ~90 seconds.  We download the clip in-memory and extract
+                 frames evenly spread across its duration.
+* RTSP / HLS  – direct stream URLs opened with OpenCV.
 """
 from __future__ import annotations
 
 import io
 import logging
 import time
+import tempfile
+import os
 from datetime import datetime
 from typing import Optional
 
 import cv2
 import numpy as np
-import yt_dlp
+import requests
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from PIL import Image
 
@@ -22,17 +30,17 @@ from .config import get_settings
 logger = logging.getLogger(__name__)
 
 # Supported URL patterns
-YOUTUBE_PATTERNS = ("youtube.com/watch", "youtu.be/", "youtube.com/live")
 RTSP_PATTERNS = ("rtsp://", "rtsps://")
 HLS_PATTERNS = (".m3u8",)
+TFL_JAMCAM_PATTERNS = ("jamcams.tfl.gov.uk",)
+
+# TfL JamCam base URLs
+TFL_S3_BASE = "https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/"
+TFL_API_BASE = "https://api.tfl.gov.uk/Place/Type/JamCam"
 
 
 class VideoCapture:
     """Captures frames from public video streams and stores them in Azure Blob Storage."""
-
-    # Local path where cookies are cached after downloading from blob storage
-    _COOKIES_LOCAL_PATH = "/tmp/youtube-cookies.txt"
-    _COOKIES_BLOB_NAME = "config/youtube-cookies.txt"
 
     def __init__(self):
         self._settings = get_settings()
@@ -40,31 +48,112 @@ class VideoCapture:
             self._settings.storage_connection_string
         )
         self._container = self._settings.frames_container
-        self._cookies_path: Optional[str] = None
-        self._ensure_cookies()
 
-    def _ensure_cookies(self) -> None:
-        """Download YouTube cookies from blob storage to a local temp file (once per process)."""
-        import os
-        if os.path.exists(self._COOKIES_LOCAL_PATH):
-            self._cookies_path = self._COOKIES_LOCAL_PATH
-            logger.info("YouTube cookies already cached at %s", self._COOKIES_LOCAL_PATH)
-            self._write_status_blob(f"cookies: already cached at {self._COOKIES_LOCAL_PATH}")
-            return
+    # ------------------------------------------------------------------
+    # Source-type detection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_tfl_jamcam(url: str) -> bool:
+        return any(p in url for p in TFL_JAMCAM_PATTERNS)
+
+    @staticmethod
+    def _is_tfl_image(url: str) -> bool:
+        """True when the TfL URL points to a JPEG still rather than an MP4 clip."""
+        return VideoCapture._is_tfl_jamcam(url) and url.endswith(".jpg")
+
+    # ------------------------------------------------------------------
+    # TfL JamCam helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_tfl_mp4_frames(
+        self,
+        mp4_url: str,
+        num_frames: int,
+    ) -> list[np.ndarray]:
+        """
+        Download a TfL JamCam MP4 clip and extract *num_frames* frames spread
+        evenly across the clip's duration.
+
+        Returns a list of BGR numpy arrays (may be shorter than num_frames if
+        the clip is very short).
+        """
+        logger.info("Downloading TfL JamCam clip: %s", mp4_url)
+        self._write_status_blob(f"tfl: downloading {mp4_url}")
+
         try:
-            container_client = self._blob_client.get_container_client(self._container)
-            blob_client = container_client.get_blob_client(self._COOKIES_BLOB_NAME)
-            with open(self._COOKIES_LOCAL_PATH, "wb") as f:
-                data = blob_client.download_blob()
-                data.readinto(f)
-            size = os.path.getsize(self._COOKIES_LOCAL_PATH)
-            self._cookies_path = self._COOKIES_LOCAL_PATH
-            logger.info("Downloaded YouTube cookies from blob to %s (%d bytes)", self._COOKIES_LOCAL_PATH, size)
-            self._write_status_blob(f"cookies: downloaded {size} bytes to {self._COOKIES_LOCAL_PATH}")
+            resp = requests.get(mp4_url, timeout=30)
+            resp.raise_for_status()
         except Exception as e:
-            logger.warning("Could not download YouTube cookies from blob: %s — proceeding without cookies", e)
-            self._cookies_path = None
-            self._write_status_blob(f"cookies: FAILED to download: {e}")
+            self._write_status_blob(f"tfl: download FAILED {mp4_url}: {e}")
+            raise
+
+        mp4_bytes = resp.content
+        logger.info("Downloaded %d bytes from TfL JamCam", len(mp4_bytes))
+        self._write_status_blob(f"tfl: downloaded {len(mp4_bytes)} bytes")
+
+        # Write to a temp file so OpenCV can open it
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp.write(mp4_bytes)
+            tmp_path = tmp.name
+
+        frames: list[np.ndarray] = []
+        try:
+            cap = cv2.VideoCapture(tmp_path)
+            if not cap.isOpened():
+                raise ValueError(f"OpenCV could not open downloaded MP4: {mp4_url}")
+
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            logger.info(
+                "TfL clip: total_frames=%d fps=%.1f", total_frames, fps
+            )
+
+            if total_frames <= 0:
+                # Fallback: read sequentially and sample
+                all_frames: list[np.ndarray] = []
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    all_frames.append(frame)
+                if all_frames:
+                    indices = _evenly_spaced_indices(len(all_frames), num_frames)
+                    frames = [all_frames[i] for i in indices]
+            else:
+                indices = _evenly_spaced_indices(total_frames, num_frames)
+                for idx in indices:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        frames.append(frame)
+
+            cap.release()
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        logger.info("Extracted %d frames from TfL clip", len(frames))
+        self._write_status_blob(f"tfl: extracted {len(frames)} frames from clip")
+        return frames
+
+    def _fetch_tfl_image_frame(self, image_url: str) -> Optional[np.ndarray]:
+        """Download a TfL JamCam JPEG still and return it as a BGR numpy array."""
+        try:
+            resp = requests.get(image_url, timeout=15)
+            resp.raise_for_status()
+            img_array = np.frombuffer(resp.content, dtype=np.uint8)
+            frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            return frame
+        except Exception as e:
+            logger.warning("Failed to fetch TfL image %s: %s", image_url, e)
+            return None
+
+    # ------------------------------------------------------------------
+    # Status blob
+    # ------------------------------------------------------------------
 
     def _write_status_blob(self, msg: str) -> None:
         """Write a status message to blob storage for debugging."""
@@ -83,84 +172,9 @@ class VideoCapture:
         except Exception:
             pass
 
-    def _get_stream_url(self, feed_url: str) -> str:
-        """
-        Resolve the actual stream URL from a video feed URL.
-        For YouTube, uses yt-dlp to get the direct stream URL.
-        """
-        if any(p in feed_url for p in YOUTUBE_PATTERNS):
-            return self._resolve_youtube_url(feed_url)
-        # For RTSP/HLS/direct URLs, return as-is
-        return feed_url
-
-    def _resolve_youtube_url(self, youtube_url: str) -> str:
-        """Use yt-dlp to get the best available stream URL for a live or VOD video."""
-        ydl_opts: dict = {
-            # Prefer a direct video+audio format ≤720p.
-            # For live streams yt-dlp returns an HLS manifest URL — OpenCV handles
-            # HLS natively via FFmpeg, so we just need the manifest URL.
-            # "best" as the final fallback ensures we always get *something*.
-            "format": "best[height<=720]/best",
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": False,
-            # Do NOT seek to the beginning of a live stream — we want the live edge.
-            "live_from_start": False,
-        }
-
-        # Use tv_embedded and android clients which bypass bot detection without
-        # requiring sign-in. These clients work from server IPs where the default
-        # web client is blocked. Cookies are not used because yt-dlp 2026.03.17
-        # has an n-challenge bug that causes "No video formats found" when cookies
-        # are present with web clients.
-        ydl_opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["tv_embedded", "android"],
-            }
-        }
-        logger.info("Using tv_embedded/android clients (no cookies)")
-
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(youtube_url, download=False)
-                if info is None:
-                    raise ValueError(f"Could not extract stream info from: {youtube_url}")
-
-                url = None
-
-                # For live streams prefer the manifest URL (HLS/DASH)
-                if info.get("is_live"):
-                    url = info.get("manifest_url") or info.get("url")
-                else:
-                    url = info.get("url")
-
-                # Fall back to iterating formats (newest / highest quality first)
-                if not url:
-                    for fmt in reversed(info.get("formats", [])):
-                        if fmt.get("url"):
-                            url = fmt["url"]
-                            break
-
-                if not url:
-                    raise ValueError(f"No stream URL found for: {youtube_url}")
-
-                self._write_status_blob(
-                    f"yt-dlp OK: {youtube_url} is_live={info.get('is_live')} "
-                    f"cookies={'yes' if self._cookies_path else 'no'} url={str(url)[:60]}"
-                )
-                logger.info(
-                    "Resolved stream URL for %s (is_live=%s)",
-                    youtube_url,
-                    info.get("is_live"),
-                )
-                return url
-        except Exception as e:
-            import traceback as _tb
-            self._write_status_blob(
-                f"yt-dlp FAIL: {youtube_url} cookies={'yes' if self._cookies_path else 'no'} "
-                f"error={str(e)[:200]}"
-            )
-            raise
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def capture_frames(
         self,
@@ -171,60 +185,58 @@ class VideoCapture:
         frame_interval_seconds: float = 10.0,
     ) -> list[tuple[bytes, str]]:
         """
-        Capture multiple frames from a video stream.
+        Capture multiple frames from a video feed.
 
-        For live streams the capture strategy is:
-          • Open the stream at the live edge.
-          • Grab a few buffered frames to flush stale data, then retrieve.
-          • Sleep `frame_interval_seconds` between captures.
+        TfL JamCam strategy
+        -------------------
+        The feed_url points to a short MP4 clip (~5-10 s) on S3 that TfL
+        refreshes every ~90 seconds.  We download the clip once and extract
+        *num_frames* frames spread evenly across it.  No sleeping between
+        frames is needed.
+
+        RTSP / HLS strategy
+        -------------------
+        Open the stream with OpenCV, flush buffered frames, then sleep
+        *frame_interval_seconds* between captures.
 
         Args:
             feed_url: Source video URL
             feed_id: Database feed ID (for blob naming)
             interval_start: 5-minute interval start time
             num_frames: Number of frames to capture
-            frame_interval_seconds: Real-time seconds to wait between frames.
-                                    Default 10 s keeps total capture time ≤ ~50 s
-                                    for 5 frames, well within the 10-min timeout.
+            frame_interval_seconds: Seconds to wait between frames (RTSP/HLS only)
 
         Returns:
             List of (jpeg_bytes, blob_url) tuples
         """
-        frames = []
+        frames_out: list[tuple[bytes, str]] = []
 
-        try:
-            stream_url = self._get_stream_url(feed_url)
-            logger.info("Resolved stream URL for feed_id=%d", feed_id)
-        except Exception as e:
-            logger.error("Failed to resolve stream URL for %s: %s", feed_url, e)
-            return frames
+        # ---- TfL JamCam path ----------------------------------------
+        if self._is_tfl_jamcam(feed_url):
+            return self._capture_tfl_frames(
+                feed_url=feed_url,
+                feed_id=feed_id,
+                interval_start=interval_start,
+                num_frames=num_frames,
+            )
 
+        # ---- RTSP / HLS stream path ---------------------------------
         cap = None
         try:
-            cap = cv2.VideoCapture(stream_url)
-            # Small buffer so we stay near the live edge
+            cap = cv2.VideoCapture(feed_url)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             if not cap.isOpened():
                 logger.error("Could not open video stream: %s", feed_url)
-                return frames
+                return frames_out
 
             fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
             logger.info("Stream opened: fps=%.1f, feed_id=%d", fps, feed_id)
 
             for i in range(num_frames):
                 if i > 0:
-                    # Sleep between frames so we capture different moments in the
-                    # broadcast without any seek overhead.
                     time.sleep(frame_interval_seconds)
 
-                # Flush a few buffered frames so we get a fresh one from the
-                # live edge rather than something that has been sitting in the
-                # decoder buffer.
-                # IMPORTANT: use grab() + retrieve() together — never call
-                # cap.read() after cap.grab() because read() calls grab()
-                # internally, which double-advances the decoder and causes
-                # ret=False on live HLS/DASH streams.
                 for _ in range(3):
                     cap.grab()
 
@@ -235,27 +247,17 @@ class VideoCapture:
                     )
                     continue
 
-                # Convert BGR → RGB
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                # Resize to max 1280×720 to reduce API costs
                 frame_rgb = self._resize_frame(frame_rgb, max_width=1280, max_height=720)
-
-                # Encode as JPEG
                 jpeg_bytes = self._encode_jpeg(frame_rgb, quality=85)
-
-                # Upload to blob storage
                 blob_url = self._upload_frame(
                     jpeg_bytes=jpeg_bytes,
                     feed_id=feed_id,
                     interval_start=interval_start,
                     frame_index=i,
                 )
-
-                frames.append((jpeg_bytes, blob_url))
-                logger.debug(
-                    "Captured frame %d/%d for feed_id=%d", i + 1, num_frames, feed_id
-                )
+                frames_out.append((jpeg_bytes, blob_url))
+                logger.debug("Captured frame %d/%d for feed_id=%d", i + 1, num_frames, feed_id)
 
         except Exception as e:
             logger.error("Frame capture error for feed_id=%d: %s", feed_id, e)
@@ -265,12 +267,89 @@ class VideoCapture:
 
         logger.info(
             "Captured %d/%d frames for feed_id=%d interval=%s",
-            len(frames),
+            len(frames_out),
             num_frames,
             feed_id,
             interval_start.isoformat(),
         )
-        return frames
+        return frames_out
+
+    def _capture_tfl_frames(
+        self,
+        feed_url: str,
+        feed_id: int,
+        interval_start: datetime,
+        num_frames: int,
+    ) -> list[tuple[bytes, str]]:
+        """
+        Capture frames from a TfL JamCam feed.
+
+        If the URL ends with .mp4 we download the clip and extract frames.
+        If the URL ends with .jpg we fetch the still image and replicate it
+        (or derive the .mp4 URL and fall back to the image on failure).
+        """
+        frames_out: list[tuple[bytes, str]] = []
+
+        # Derive companion URLs
+        if feed_url.endswith(".mp4"):
+            mp4_url = feed_url
+            jpg_url = feed_url[:-4] + ".jpg"
+        elif feed_url.endswith(".jpg"):
+            jpg_url = feed_url
+            mp4_url = feed_url[:-4] + ".mp4"
+        else:
+            mp4_url = feed_url
+            jpg_url = None
+
+        bgr_frames: list[np.ndarray] = []
+
+        # Try MP4 first
+        try:
+            bgr_frames = self._fetch_tfl_mp4_frames(mp4_url, num_frames)
+        except Exception as e:
+            logger.warning(
+                "TfL MP4 fetch failed for feed_id=%d (%s): %s — trying JPEG fallback",
+                feed_id, mp4_url, e,
+            )
+
+        # Fall back to JPEG still if MP4 failed or yielded no frames
+        if not bgr_frames and jpg_url:
+            logger.info("Falling back to TfL JPEG still: %s", jpg_url)
+            frame = self._fetch_tfl_image_frame(jpg_url)
+            if frame is not None:
+                # Replicate the single still to fill num_frames slots
+                bgr_frames = [frame] * num_frames
+
+        if not bgr_frames:
+            logger.error(
+                "No frames obtained from TfL feed_id=%d url=%s", feed_id, feed_url
+            )
+            return frames_out
+
+        for i, bgr_frame in enumerate(bgr_frames[:num_frames]):
+            frame_rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+            frame_rgb = self._resize_frame(frame_rgb, max_width=1280, max_height=720)
+            jpeg_bytes = self._encode_jpeg(frame_rgb, quality=85)
+            blob_url = self._upload_frame(
+                jpeg_bytes=jpeg_bytes,
+                feed_id=feed_id,
+                interval_start=interval_start,
+                frame_index=i,
+            )
+            frames_out.append((jpeg_bytes, blob_url))
+
+        logger.info(
+            "Captured %d/%d TfL frames for feed_id=%d interval=%s",
+            len(frames_out),
+            num_frames,
+            feed_id,
+            interval_start.isoformat(),
+        )
+        return frames_out
+
+    # ------------------------------------------------------------------
+    # Frame helpers
+    # ------------------------------------------------------------------
 
     def _resize_frame(
         self,
@@ -282,7 +361,6 @@ class VideoCapture:
         h, w = frame.shape[:2]
         if w <= max_width and h <= max_height:
             return frame
-
         scale = min(max_width / w, max_height / h)
         new_w = int(w * scale)
         new_h = int(h * scale)
@@ -303,7 +381,6 @@ class VideoCapture:
         frame_index: int,
     ) -> str:
         """Upload a frame to Azure Blob Storage and return the blob URL."""
-        # Blob path: video-frames/feed_{id}/YYYY/MM/DD/HH/YYYYMMDD_HHMM_frame{NN}.jpg
         date_path = interval_start.strftime("%Y/%m/%d/%H")
         timestamp_str = interval_start.strftime("%Y%m%d_%H%M")
         blob_name = f"feed_{feed_id}/{date_path}/{timestamp_str}_frame{frame_index:02d}.jpg"
@@ -311,20 +388,17 @@ class VideoCapture:
         try:
             container_client = self._blob_client.get_container_client(self._container)
             blob_client = container_client.get_blob_client(blob_name)
-
             blob_client.upload_blob(
                 jpeg_bytes,
                 overwrite=True,
                 content_settings=ContentSettings(content_type="image/jpeg"),
             )
-
             account_name = self._settings.storage_account_name
             blob_url = (
                 f"https://{account_name}.blob.core.windows.net"
                 f"/{self._container}/{blob_name}"
             )
             return blob_url
-
         except Exception as e:
             logger.warning("Failed to upload frame to blob storage: %s", e)
             return ""
@@ -343,6 +417,20 @@ class VideoCapture:
             num_frames=1,
         )
         return frames[0] if frames else None
+
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
+def _evenly_spaced_indices(total: int, n: int) -> list[int]:
+    """Return *n* indices spread evenly across [0, total)."""
+    if n <= 0 or total <= 0:
+        return []
+    if n >= total:
+        return list(range(total))
+    step = total / n
+    return [int(step * i + step / 2) for i in range(n)]
 
 
 # Singleton

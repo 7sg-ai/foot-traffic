@@ -24,7 +24,7 @@
       "value": "sqladmin"
     },
     "videoFeedUrls": {
-      "value": "https://www.youtube.com/watch?v=rnCTiKOB6Ks,https://www.youtube.com/watch?v=AdUw5RdyZxI,https://www.youtube.com/watch?v=3HBsHMFRFpo"
+      "value": "https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.07450.mp4,https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.08858.mp4,https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.08750.mp4"
     }
   }
 }

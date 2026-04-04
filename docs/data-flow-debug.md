@@ -7,15 +7,15 @@ End-to-end walkthrough of how data moves through the Foot Traffic Analyzer, with
 ## Data Flow Overview
 
 ```
-Video Feed URLs
+Video Feed URLs (TfL JamCams)
      │
      ▼
 [1] video_scheduler (Timer, every 5 min)
      │  reads active feeds from Synapse
-     │  resolves stream URL via yt-dlp
      ▼
 [2] VideoCapture
-     │  captures N frames via OpenCV
+     │  downloads TfL JamCam MP4 clip (or JPEG still fallback)
+     │  extracts N frames via OpenCV
      │  uploads JPEGs → Azure Blob Storage (video-frames/)
      ▼
 [3] VLMAnalyzer (Azure OpenAI gpt-5.3-chat)
@@ -39,7 +39,7 @@ Video Feed URLs
 
 ## Stage 1 — Timer Trigger & Feed Resolution
 
-**What happens:** `video_scheduler` fires every 5 minutes, reads active feeds from `traffic.video_feeds`, and falls back to `VIDEO_FEED_URLS` env var if Synapse is unreachable.
+**What happens:** `video_scheduler` fires every 5 minutes and reads active feeds from `traffic.video_feeds`.
 
 ### Verify the scheduler is running
 
@@ -60,7 +60,7 @@ az containerapp logs show \
 **Expected log lines every 5 minutes:**
 ```
 Video scheduler triggered at 2026-04-03T20:00:00+00:00 | interval: 2026-04-03T20:00:00 -> 2026-04-03T20:05:00
-Processing 3 active video feeds
+Processing 5 active video feeds
 ```
 
 ### Debug: scheduler not firing
@@ -69,7 +69,7 @@ Processing 3 active video feeds
 |---|---|
 | No logs at all | Container App has 0 replicas — `minReplicas` must be `1` |
 | `Failed to fetch active feeds from Synapse` | Synapse pool is paused or credentials wrong — see Stage 4 |
-| `No active video feeds configured` | Both Synapse feeds table and `VIDEO_FEED_URLS` env var are empty |
+| `No active video feeds configured` | Synapse feeds table is empty — re-run `database/schema.sql` |
 | Timer is past due warning | Container restarted mid-interval — harmless, will self-correct |
 
 ### Verify feeds in Synapse
@@ -80,13 +80,13 @@ FROM traffic.video_feeds
 ORDER BY feed_id;
 ```
 
-Expected: 3 rows (Times Square, Piccadilly, Shibuya) with `is_active = 1`.
+Expected: 5 rows (Piccadilly Circus, Oxford Street, Hyde Park Corner, Westminster Bridge, Tower Bridge Approach) with `is_active = 1`.
 
 ---
 
 ## Stage 2 — Frame Capture (VideoCapture → Blob Storage)
 
-**What happens:** For each feed, `VideoCapture.capture_frames()` resolves the stream URL (via `yt-dlp` for YouTube), opens it with OpenCV, grabs `FRAMES_PER_INTERVAL` frames (default: 5), resizes to max 1280×720, encodes as JPEG, and uploads to the `video-frames` blob container.
+**What happens:** For each feed, `VideoCapture.capture_frames()` downloads the TfL JamCam MP4 clip from S3, extracts `FRAMES_PER_INTERVAL` frames (default: 5) spread evenly across the clip, resizes to max 1280×720, encodes as JPEG, and uploads to the `video-frames` blob container. If the MP4 download fails, it falls back to the companion JPEG still.
 
 Blob path pattern:
 ```
@@ -112,12 +112,20 @@ az storage blob list \
 
 | Symptom | Likely cause |
 |---|---|
-| `Failed to resolve stream URL` | `yt-dlp` can't reach YouTube — check egress from Container App |
-| `Could not open video stream` | OpenCV can't connect to the resolved URL — stream may be geo-blocked or offline |
-| `Failed to read frame N/N` | Stream opened but returned no data — live stream may have ended |
+| `tfl: download FAILED` | TfL S3 bucket unreachable — check egress from Container App |
+| `OpenCV could not open downloaded MP4` | Corrupt or empty MP4 from TfL — JPEG fallback will be attempted |
+| `No frames obtained from TfL feed` | Both MP4 and JPEG fallback failed — TfL camera may be offline |
 | `Failed to upload frame to blob storage` | Storage connection string wrong or `video-frames` container missing |
 
 ```bash
+# Check the capture-status.log blob for detailed TfL download diagnostics
+az storage blob download \
+  --account-name <storage-account-name> \
+  --container-name video-frames \
+  --name capture-status.log \
+  --file /dev/stdout \
+  --auth-mode login
+
 # Confirm the video-frames container exists
 az storage container show \
   --name video-frames \
@@ -170,13 +178,13 @@ FUNC_URL=$(az containerapp show \
   --resource-group <resource-group> \
   --query "properties.configuration.ingress.fqdn" -o tsv)
 
-# POST to analyze feed 1 with 2 frames
+# POST to analyze feed 1 (Piccadilly Circus) with 2 frames
 curl -s -X POST "https://${FUNC_URL}/api/analyze_feed" \
   -H "Content-Type: application/json" \
   -d '{
     "feed_id": 1,
-    "feed_url": "https://www.youtube.com/watch?v=rnCTiKOB6Ks",
-    "feed_name": "Times Square Test",
+    "feed_url": "https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.07450.mp4",
+    "feed_name": "Piccadilly Circus",
     "num_frames": 2
   }' | jq .
 ```

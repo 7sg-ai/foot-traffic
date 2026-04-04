@@ -20,7 +20,7 @@
     "SYNAPSE_USERNAME": "sqladmin",
     "SYNAPSE_PASSWORD": "YourPassword123!",
 
-    "VIDEO_FEED_URLS": "https://www.youtube.com/watch?v=rnCTiKOB6Ks",
+    "VIDEO_FEED_URLS": "https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.07450.mp4",
     "FRAMES_PER_INTERVAL": "3",
     "MAX_PERSONS_PER_FRAME": "10",
     "CONFIDENCE_THRESHOLD": "0.6",

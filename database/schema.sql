@@ -261,24 +261,34 @@ WITH
 GO
 
 -- =============================================================================
--- Seed: Default video feeds
+-- Seed: Default video feeds (TfL JamCams)
 -- =============================================================================
 -- Synapse Dedicated SQL Pool: INSERT ... VALUES only accepts constant literals —
 -- no function calls (not even GETUTCDATE()). Use INSERT ... SELECT instead,
 -- which does allow function calls. Each row is a separate idempotent statement.
 IF NOT EXISTS (SELECT 1 FROM traffic.video_feeds WHERE feed_id = 1)
-    INSERT INTO traffic.video_feeds (feed_id, feed_name, feed_url, location_name, timezone, created_at, updated_at)
-    SELECT 1, 'Times Square NYC Live', 'https://www.youtube.com/watch?v=rnCTiKOB6Ks', 'Times Square, New York, NY', 'America/New_York', GETUTCDATE(), GETUTCDATE();
+    INSERT INTO traffic.video_feeds (feed_id, feed_name, feed_url, location_name, latitude, longitude, timezone, created_at, updated_at)
+    SELECT 1, 'Piccadilly Circus', 'https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.07450.mp4', 'Piccadilly Circus, London, UK', 51.5096, -0.13484, 'Europe/London', GETUTCDATE(), GETUTCDATE();
 GO
 
 IF NOT EXISTS (SELECT 1 FROM traffic.video_feeds WHERE feed_id = 2)
-    INSERT INTO traffic.video_feeds (feed_id, feed_name, feed_url, location_name, timezone, created_at, updated_at)
-    SELECT 2, 'Piccadilly Circus London', 'https://www.youtube.com/watch?v=AdUw5RdyZxI', 'Piccadilly Circus, London, UK', 'Europe/London', GETUTCDATE(), GETUTCDATE();
+    INSERT INTO traffic.video_feeds (feed_id, feed_name, feed_url, location_name, latitude, longitude, timezone, created_at, updated_at)
+    SELECT 2, 'Oxford Street / Orchard Street', 'https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.08858.mp4', 'Oxford Street / Orchard Street, London, UK', 51.514, -0.15409, 'Europe/London', GETUTCDATE(), GETUTCDATE();
 GO
 
 IF NOT EXISTS (SELECT 1 FROM traffic.video_feeds WHERE feed_id = 3)
-    INSERT INTO traffic.video_feeds (feed_id, feed_name, feed_url, location_name, timezone, created_at, updated_at)
-    SELECT 3, 'Shibuya Crossing Tokyo', 'https://www.youtube.com/watch?v=3HBsHMFRFpo', 'Shibuya Crossing, Tokyo, Japan', 'Asia/Tokyo', GETUTCDATE(), GETUTCDATE();
+    INSERT INTO traffic.video_feeds (feed_id, feed_name, feed_url, location_name, latitude, longitude, timezone, created_at, updated_at)
+    SELECT 3, 'Hyde Park Corner', 'https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.08750.mp4', 'Hyde Park Corner, London, UK', 51.5033, -0.15099, 'Europe/London', GETUTCDATE(), GETUTCDATE();
+GO
+
+IF NOT EXISTS (SELECT 1 FROM traffic.video_feeds WHERE feed_id = 4)
+    INSERT INTO traffic.video_feeds (feed_id, feed_name, feed_url, location_name, latitude, longitude, timezone, created_at, updated_at)
+    SELECT 4, 'Westminster Bridge', 'https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.04502.mp4', 'Westminster Bridge, London, UK', 51.5009, -0.11762, 'Europe/London', GETUTCDATE(), GETUTCDATE();
+GO
+
+IF NOT EXISTS (SELECT 1 FROM traffic.video_feeds WHERE feed_id = 5)
+    INSERT INTO traffic.video_feeds (feed_id, feed_name, feed_url, location_name, latitude, longitude, timezone, created_at, updated_at)
+    SELECT 5, 'Tower Bridge Approach', 'https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.03500.mp4', 'Tower Bridge Approach, London, UK', 51.509, -0.07368, 'Europe/London', GETUTCDATE(), GETUTCDATE();
 GO
 
 -- =============================================================================

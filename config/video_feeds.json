@@ -2,36 +2,68 @@
   "feeds": [
     {
       "feed_id": 1,
-      "feed_name": "Times Square NYC Live",
-      "feed_url": "https://www.youtube.com/watch?v=rnXIjl_Rzy4",
-      "location_name": "Times Square, New York, NY",
-      "latitude": 40.7580,
-      "longitude": -73.9855,
-      "timezone": "America/New_York",
+      "feed_name": "Piccadilly Circus",
+      "feed_url": "https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.07450.mp4",
+      "feed_url_image": "https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.07450.jpg",
+      "tfl_camera_id": "JamCams_00001.07450",
+      "location_name": "Piccadilly Circus, London, UK",
+      "latitude": 51.5096,
+      "longitude": -0.13484,
+      "timezone": "Europe/London",
       "is_active": true,
-      "notes": "EarthCam Live: Times Square in 4K - 24/7 live stream"
+      "notes": "TfL JamCam: Piccadilly Circus - refreshed every ~90 seconds"
     },
     {
       "feed_id": 2,
-      "feed_name": "Abbey Road Crossing London",
-      "feed_url": "https://www.youtube.com/watch?v=M3EYAY2MftI",
-      "location_name": "Abbey Road Crossing, London, UK",
-      "latitude": 51.5320,
-      "longitude": -0.1778,
+      "feed_name": "Oxford Street / Orchard Street",
+      "feed_url": "https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.08858.mp4",
+      "feed_url_image": "https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.08858.jpg",
+      "tfl_camera_id": "JamCams_00001.08858",
+      "location_name": "Oxford Street / Orchard Street, London, UK",
+      "latitude": 51.514,
+      "longitude": -0.15409,
       "timezone": "Europe/London",
       "is_active": true,
-      "notes": "EarthCam Live: Abbey Road Crossing - 24/7 live stream"
+      "notes": "TfL JamCam: Oxford Street at Orchard Street - refreshed every ~90 seconds"
     },
     {
       "feed_id": 3,
-      "feed_name": "Shibuya Crossing Tokyo",
-      "feed_url": "https://www.youtube.com/watch?v=3Q5wZeTuttw",
-      "location_name": "Shibuya Crossing, Tokyo, Japan",
-      "latitude": 35.6595,
-      "longitude": 139.7004,
-      "timezone": "Asia/Tokyo",
+      "feed_name": "Hyde Park Corner",
+      "feed_url": "https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.08750.mp4",
+      "feed_url_image": "https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.08750.jpg",
+      "tfl_camera_id": "JamCams_00001.08750",
+      "location_name": "Hyde Park Corner, London, UK",
+      "latitude": 51.5033,
+      "longitude": -0.15099,
+      "timezone": "Europe/London",
       "is_active": true,
-      "notes": "Shibuya Sky Live Camera - official 24/7 stream from observation deck"
+      "notes": "TfL JamCam: Hyde Park Corner / Park Lane - refreshed every ~90 seconds"
+    },
+    {
+      "feed_id": 4,
+      "feed_name": "Westminster Bridge",
+      "feed_url": "https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.04502.mp4",
+      "feed_url_image": "https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.04502.jpg",
+      "tfl_camera_id": "JamCams_00001.04502",
+      "location_name": "Westminster Bridge, London, UK",
+      "latitude": 51.5009,
+      "longitude": -0.11762,
+      "timezone": "Europe/London",
+      "is_active": true,
+      "notes": "TfL JamCam: Westminster Bridge / York Road - refreshed every ~90 seconds"
+    },
+    {
+      "feed_id": 5,
+      "feed_name": "Tower Bridge Approach",
+      "feed_url": "https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.03500.mp4",
+      "feed_url_image": "https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/00001.03500.jpg",
+      "tfl_camera_id": "JamCams_00001.03500",
+      "location_name": "Tower Bridge Approach, London, UK",
+      "latitude": 51.509,
+      "longitude": -0.07368,
+      "timezone": "Europe/London",
+      "is_active": true,
+      "notes": "TfL JamCam: Tower Bridge Approach / East Smithfield - refreshed every ~90 seconds"
     }
   ],
   "settings": {

@@ -35,22 +35,12 @@ class Settings:
     synapse_username: str = field(default_factory=lambda: os.environ["SYNAPSE_USERNAME"])
     synapse_password: str = field(default_factory=lambda: os.environ["SYNAPSE_PASSWORD"])
 
-    # Video feeds
-    video_feed_urls: str = field(default_factory=lambda: os.environ.get("VIDEO_FEED_URLS", ""))
-
     # Analysis settings
     frames_per_interval: int = field(default_factory=lambda: int(os.environ.get("FRAMES_PER_INTERVAL", "5")))
     max_persons_per_frame: int = field(default_factory=lambda: int(os.environ.get("MAX_PERSONS_PER_FRAME", "20")))
     confidence_threshold: float = field(
         default_factory=lambda: float(os.environ.get("CONFIDENCE_THRESHOLD", "0.6"))
     )
-
-    @property
-    def video_feed_list(self) -> list[str]:
-        """Parse comma-separated video feed URLs."""
-        if not self.video_feed_urls:
-            return []
-        return [url.strip() for url in self.video_feed_urls.split(",") if url.strip()]
 
     @property
     def synapse_connection_string(self) -> str:

@@ -23,9 +23,6 @@ param openAiModelVersion string = '2025-02-01'
 @description('Synapse SQL admin username')
 param synapseSqlAdminUser string = 'sqladmin'
 
-@description('Public video feed URLs (comma-separated)')
-param videoFeedUrls string = 'https://www.youtube.com/watch?v=rnXIjl_Rzy4,https://www.youtube.com/watch?v=M3EYAY2MftI,https://www.youtube.com/watch?v=3Q5wZeTuttw'
-
 @description('Principal ID of the user/SP running the deployment (optional — grants Key Vault Secrets User so postprovision.sh can read secrets)')
 param deploymentPrincipalId string = ''
 
@@ -387,8 +384,6 @@ resource functionsContainerApp 'Microsoft.App/containerApps@2023-05-01' = {
             { name: 'SYNAPSE_DATABASE', value: synapseSqlPool.name }
             { name: 'SYNAPSE_USERNAME', value: synapseSqlAdminUser }
             { name: 'SYNAPSE_PASSWORD', secretRef: 'synapse-password' }
-            // Video feeds
-            { name: 'VIDEO_FEED_URLS', value: videoFeedUrls }
             // Key Vault URI
             { name: 'KEY_VAULT_URI', value: keyVault.properties.vaultUri }
           ]

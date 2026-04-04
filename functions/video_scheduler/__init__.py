@@ -57,18 +57,17 @@ def main(mytimer: func.TimerRequest) -> None:
     capturer = get_video_capture()
     analyzer = get_vlm_analyzer()
 
-    # Get active feeds from database (primary source of truth)
+    # Get active feeds from database — the single source of truth.
+    # No env var fallback: feed management belongs in the DB.
     try:
         feeds = db.get_active_feeds()
         logger.info("Loaded %d active feeds from database", len(feeds))
     except Exception as e:
-        logger.error("Failed to fetch active feeds from database: %s", e)
-        # Fall back to environment variable feeds
-        feeds = _get_feeds_from_env(settings)
-        logger.info("Falling back to %d env var feeds", len(feeds))
+        logger.error("Failed to fetch active feeds from database: %s — aborting run", e)
+        return
 
     if not feeds:
-        logger.warning("No active video feeds configured. Skipping analysis.")
+        logger.warning("No active video feeds in database. Skipping analysis.")
         return
 
     logger.info("Processing %d active video feeds", len(feeds))
@@ -201,17 +200,3 @@ def _floor_to_5min(dt: datetime) -> datetime:
     return dt.replace(minute=minute, second=0, microsecond=0)
 
 
-def _get_feeds_from_env(settings) -> list:
-    """Build feed objects from environment variable as fallback."""
-    from shared.models import VideoFeed
-
-    feeds = []
-    for i, url in enumerate(settings.video_feed_list, start=1):
-        feeds.append(VideoFeed(
-            feed_id=i,
-            feed_name=f"Feed {i}",
-            feed_url=url,
-            location_name="Unknown",
-            timezone="UTC",
-        ))
-    return feeds

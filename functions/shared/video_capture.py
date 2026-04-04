@@ -108,20 +108,17 @@ class VideoCapture:
             "live_from_start": False,
         }
 
-        if self._cookies_path:
-            # Use cookies to authenticate — bypasses YouTube bot detection on
-            # Azure datacenter IPs. Cookies are downloaded from blob storage at startup.
-            ydl_opts["cookiefile"] = self._cookies_path
-            logger.info("Using YouTube cookies from %s", self._cookies_path)
-        else:
-            # No cookies available — use tv_embedded/android clients which work
-            # without sign-in from some server IPs.
-            ydl_opts["extractor_args"] = {
-                "youtube": {
-                    "player_client": ["tv_embedded", "android"],
-                }
+        # Use tv_embedded and android clients which bypass bot detection without
+        # requiring sign-in. These clients work from server IPs where the default
+        # web client is blocked. Cookies are not used because yt-dlp 2026.03.17
+        # has an n-challenge bug that causes "No video formats found" when cookies
+        # are present with web clients.
+        ydl_opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["tv_embedded", "android"],
             }
-            logger.info("No cookies available — using tv_embedded/android clients")
+        }
+        logger.info("Using tv_embedded/android clients (no cookies)")
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:

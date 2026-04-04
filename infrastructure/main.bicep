@@ -24,7 +24,7 @@ param openAiModelVersion string = '2025-02-01'
 param synapseSqlAdminUser string = 'sqladmin'
 
 @description('Public video feed URLs (comma-separated)')
-param videoFeedUrls string = 'https://www.youtube.com/watch?v=rnCTiKOB6Ks,https://www.youtube.com/watch?v=AdUw5RdyZxI'
+param videoFeedUrls string = 'https://www.youtube.com/watch?v=rnXIjl_Rzy4,https://www.youtube.com/watch?v=M3EYAY2MftI,https://www.youtube.com/watch?v=3Q5wZeTuttw'
 
 @description('Principal ID of the user/SP running the deployment (optional — grants Key Vault Secrets User so postprovision.sh can read secrets)')
 param deploymentPrincipalId string = ''

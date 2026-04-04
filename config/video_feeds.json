@@ -20,7 +20,7 @@
       "longitude": -0.1778,
       "timezone": "Europe/London",
       "is_active": true,
-      "notes": "EarthCam Live: Abbey Road Crossing - 24/7 live stream (replaced Piccadilly Circus which went offline)"
+      "notes": "EarthCam Live: Abbey Road Crossing - 24/7 live stream"
     },
     {
       "feed_id": 3,
@@ -36,7 +36,7 @@
   ],
   "settings": {
     "frames_per_interval": 5,
-    "frame_interval_seconds": 60,
+    "frame_interval_seconds": 10,
     "max_persons_per_frame": 20,
     "confidence_threshold": 0.6,
     "analysis_schedule_cron": "0 */5 * * * *"

@@ -30,12 +30,37 @@ HLS_PATTERNS = (".m3u8",)
 class VideoCapture:
     """Captures frames from public video streams and stores them in Azure Blob Storage."""
 
+    # Local path where cookies are cached after downloading from blob storage
+    _COOKIES_LOCAL_PATH = "/tmp/youtube-cookies.txt"
+    _COOKIES_BLOB_NAME = "config/youtube-cookies.txt"
+
     def __init__(self):
         self._settings = get_settings()
         self._blob_client = BlobServiceClient.from_connection_string(
             self._settings.storage_connection_string
         )
         self._container = self._settings.frames_container
+        self._cookies_path: Optional[str] = None
+        self._ensure_cookies()
+
+    def _ensure_cookies(self) -> None:
+        """Download YouTube cookies from blob storage to a local temp file (once per process)."""
+        import os
+        if os.path.exists(self._COOKIES_LOCAL_PATH):
+            self._cookies_path = self._COOKIES_LOCAL_PATH
+            logger.info("YouTube cookies already cached at %s", self._COOKIES_LOCAL_PATH)
+            return
+        try:
+            container_client = self._blob_client.get_container_client(self._container)
+            blob_client = container_client.get_blob_client(self._COOKIES_BLOB_NAME)
+            with open(self._COOKIES_LOCAL_PATH, "wb") as f:
+                data = blob_client.download_blob()
+                data.readinto(f)
+            self._cookies_path = self._COOKIES_LOCAL_PATH
+            logger.info("Downloaded YouTube cookies from blob to %s", self._COOKIES_LOCAL_PATH)
+        except Exception as e:
+            logger.warning("Could not download YouTube cookies from blob: %s — proceeding without cookies", e)
+            self._cookies_path = None
 
     def _get_stream_url(self, feed_url: str) -> str:
         """
@@ -49,7 +74,7 @@ class VideoCapture:
 
     def _resolve_youtube_url(self, youtube_url: str) -> str:
         """Use yt-dlp to get the best available stream URL for a live or VOD video."""
-        ydl_opts = {
+        ydl_opts: dict = {
             # Prefer a direct video+audio format ≤720p.
             # For live streams yt-dlp returns an HLS manifest URL — OpenCV handles
             # HLS natively via FFmpeg, so we just need the manifest URL.
@@ -60,15 +85,22 @@ class VideoCapture:
             "extract_flat": False,
             # Do NOT seek to the beginning of a live stream — we want the live edge.
             "live_from_start": False,
-            # Bypass YouTube bot detection on Azure datacenter IPs.
-            # tv_embedded and android clients do not require sign-in and work
-            # from server IPs where the default web client is bot-blocked.
-            "extractor_args": {
+        }
+
+        if self._cookies_path:
+            # Use cookies to authenticate — bypasses YouTube bot detection on
+            # Azure datacenter IPs. Cookies are downloaded from blob storage at startup.
+            ydl_opts["cookiefile"] = self._cookies_path
+            logger.info("Using YouTube cookies from %s", self._cookies_path)
+        else:
+            # No cookies available — use tv_embedded/android clients which work
+            # without sign-in from some server IPs.
+            ydl_opts["extractor_args"] = {
                 "youtube": {
                     "player_client": ["tv_embedded", "android"],
                 }
-            },
-        }
+            }
+            logger.info("No cookies available — using tv_embedded/android clients")
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(youtube_url, download=False)

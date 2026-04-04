@@ -49,6 +49,7 @@ class VideoCapture:
         if os.path.exists(self._COOKIES_LOCAL_PATH):
             self._cookies_path = self._COOKIES_LOCAL_PATH
             logger.info("YouTube cookies already cached at %s", self._COOKIES_LOCAL_PATH)
+            self._write_status_blob(f"cookies: already cached at {self._COOKIES_LOCAL_PATH}")
             return
         try:
             container_client = self._blob_client.get_container_client(self._container)
@@ -56,11 +57,31 @@ class VideoCapture:
             with open(self._COOKIES_LOCAL_PATH, "wb") as f:
                 data = blob_client.download_blob()
                 data.readinto(f)
+            size = os.path.getsize(self._COOKIES_LOCAL_PATH)
             self._cookies_path = self._COOKIES_LOCAL_PATH
-            logger.info("Downloaded YouTube cookies from blob to %s", self._COOKIES_LOCAL_PATH)
+            logger.info("Downloaded YouTube cookies from blob to %s (%d bytes)", self._COOKIES_LOCAL_PATH, size)
+            self._write_status_blob(f"cookies: downloaded {size} bytes to {self._COOKIES_LOCAL_PATH}")
         except Exception as e:
             logger.warning("Could not download YouTube cookies from blob: %s — proceeding without cookies", e)
             self._cookies_path = None
+            self._write_status_blob(f"cookies: FAILED to download: {e}")
+
+    def _write_status_blob(self, msg: str) -> None:
+        """Write a status message to blob storage for debugging."""
+        try:
+            import datetime as _dt
+            ts = _dt.datetime.utcnow().isoformat()
+            existing = ""
+            try:
+                blob = self._blob_client.get_blob_client(self._container, "capture-status.log")
+                existing = blob.download_blob().readall().decode()
+            except Exception:
+                pass
+            content = existing + f"\n[{ts}] {msg}"
+            blob = self._blob_client.get_blob_client(self._container, "capture-status.log")
+            blob.upload_blob(content.encode(), overwrite=True)
+        except Exception:
+            pass
 
     def _get_stream_url(self, feed_url: str) -> str:
         """
@@ -102,35 +123,47 @@ class VideoCapture:
             }
             logger.info("No cookies available — using tv_embedded/android clients")
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(youtube_url, download=False)
-            if info is None:
-                raise ValueError(f"Could not extract stream info from: {youtube_url}")
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(youtube_url, download=False)
+                if info is None:
+                    raise ValueError(f"Could not extract stream info from: {youtube_url}")
 
-            url = None
+                url = None
 
-            # For live streams prefer the manifest URL (HLS/DASH)
-            if info.get("is_live"):
-                url = info.get("manifest_url") or info.get("url")
-            else:
-                url = info.get("url")
+                # For live streams prefer the manifest URL (HLS/DASH)
+                if info.get("is_live"):
+                    url = info.get("manifest_url") or info.get("url")
+                else:
+                    url = info.get("url")
 
-            # Fall back to iterating formats (newest / highest quality first)
-            if not url:
-                for fmt in reversed(info.get("formats", [])):
-                    if fmt.get("url"):
-                        url = fmt["url"]
-                        break
+                # Fall back to iterating formats (newest / highest quality first)
+                if not url:
+                    for fmt in reversed(info.get("formats", [])):
+                        if fmt.get("url"):
+                            url = fmt["url"]
+                            break
 
-            if not url:
-                raise ValueError(f"No stream URL found for: {youtube_url}")
+                if not url:
+                    raise ValueError(f"No stream URL found for: {youtube_url}")
 
-            logger.info(
-                "Resolved stream URL for %s (is_live=%s)",
-                youtube_url,
-                info.get("is_live"),
+                self._write_status_blob(
+                    f"yt-dlp OK: {youtube_url} is_live={info.get('is_live')} "
+                    f"cookies={'yes' if self._cookies_path else 'no'} url={str(url)[:60]}"
+                )
+                logger.info(
+                    "Resolved stream URL for %s (is_live=%s)",
+                    youtube_url,
+                    info.get("is_live"),
+                )
+                return url
+        except Exception as e:
+            import traceback as _tb
+            self._write_status_blob(
+                f"yt-dlp FAIL: {youtube_url} cookies={'yes' if self._cookies_path else 'no'} "
+                f"error={str(e)[:200]}"
             )
-            return url
+            raise
 
     def capture_frames(
         self,

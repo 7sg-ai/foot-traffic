@@ -210,11 +210,12 @@ curl -s -X POST "https://${FUNC_URL}/api/analyze_feed" \
 | `status: "failed"`, `error: "No frames could be captured"` | Frame capture failed before VLM was called — debug Stage 2 first |
 
 ```bash
-# Check token usage in App Insights
-az monitor app-insights query \
-  --app <app-insights-name> \
+# Check token usage in the Functions container logs
+az containerapp logs show \
+  --name <func-container-app-name> \
   --resource-group <resource-group> \
-  --analytics-query "traces | where message contains 'VLM analysis complete' | project timestamp, message | order by timestamp desc | take 20"
+  --tail 100 \
+  --query "[?contains(Log,'VLM analysis complete')]"
 ```
 
 ---
@@ -457,11 +458,18 @@ sqlcmd \
   -I -C
 ```
 
-### Checking App Insights for errors
+### Checking container logs for errors
 
 ```bash
-az monitor app-insights query \
-  --app <app-insights-name> \
+# Stream recent errors from the Functions container
+az containerapp logs show \
+  --name <func-container-app-name> \
   --resource-group <resource-group> \
-  --analytics-query "exceptions | order by timestamp desc | take 20 | project timestamp, type, outerMessage, severityLevel"
+  --tail 50
+
+# Stream recent errors from the Streamlit container
+az containerapp logs show \
+  --name <streamlit-container-app-name> \
+  --resource-group <resource-group> \
+  --tail 50
 ```

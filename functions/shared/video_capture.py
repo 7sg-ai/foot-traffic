@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import io
 import logging
-import os
-import tempfile
 import time
 from datetime import datetime
 from typing import Optional
@@ -50,12 +48,18 @@ class VideoCapture:
         return feed_url
 
     def _resolve_youtube_url(self, youtube_url: str) -> str:
-        """Use yt-dlp to get the best available stream URL."""
+        """Use yt-dlp to get the best available stream URL for a live or VOD video."""
         ydl_opts = {
-            "format": "best[height<=720][ext=mp4]/best[height<=720]/best",
+            # Prefer a direct video+audio format ≤720p.
+            # For live streams yt-dlp returns an HLS manifest URL — OpenCV handles
+            # HLS natively via FFmpeg, so we just need the manifest URL.
+            # "best" as the final fallback ensures we always get *something*.
+            "format": "best[height<=720]/best",
             "quiet": True,
             "no_warnings": True,
             "extract_flat": False,
+            # Do NOT seek to the beginning of a live stream — we want the live edge.
+            "live_from_start": False,
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -63,16 +67,17 @@ class VideoCapture:
             if info is None:
                 raise ValueError(f"Could not extract stream info from: {youtube_url}")
 
-            # For live streams, get the manifest URL
+            url = None
+
+            # For live streams prefer the manifest URL (HLS/DASH)
             if info.get("is_live"):
-                url = info.get("url") or info.get("manifest_url")
+                url = info.get("manifest_url") or info.get("url")
             else:
                 url = info.get("url")
 
+            # Fall back to iterating formats (newest / highest quality first)
             if not url:
-                # Try formats list
-                formats = info.get("formats", [])
-                for fmt in reversed(formats):
+                for fmt in reversed(info.get("formats", [])):
                     if fmt.get("url"):
                         url = fmt["url"]
                         break
@@ -80,7 +85,11 @@ class VideoCapture:
             if not url:
                 raise ValueError(f"No stream URL found for: {youtube_url}")
 
-            logger.info("Resolved stream URL for %s", youtube_url)
+            logger.info(
+                "Resolved stream URL for %s (is_live=%s)",
+                youtube_url,
+                info.get("is_live"),
+            )
             return url
 
     def capture_frames(
@@ -89,17 +98,25 @@ class VideoCapture:
         feed_id: int,
         interval_start: datetime,
         num_frames: int = 5,
-        frame_interval_seconds: float = 60.0,
+        frame_interval_seconds: float = 10.0,
     ) -> list[tuple[bytes, str]]:
         """
         Capture multiple frames from a video stream.
+
+        For live streams the capture strategy is:
+          • Open the stream at the live edge.
+          • Read a frame, sleep `frame_interval_seconds`, repeat.
+        This avoids the previous approach of calling cap.grab() thousands of
+        times to skip 60 s of video, which caused timeouts on live HLS streams.
 
         Args:
             feed_url: Source video URL
             feed_id: Database feed ID (for blob naming)
             interval_start: 5-minute interval start time
             num_frames: Number of frames to capture
-            frame_interval_seconds: Seconds between frame captures
+            frame_interval_seconds: Real-time seconds to wait between frames.
+                                    Default 10 s keeps total capture time ≤ ~50 s
+                                    for 5 frames, well within the 10-min timeout.
 
         Returns:
             List of (jpeg_bytes, blob_url) tuples
@@ -115,32 +132,40 @@ class VideoCapture:
         cap = None
         try:
             cap = cv2.VideoCapture(stream_url)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
+            # Small buffer so we stay near the live edge
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             if not cap.isOpened():
                 logger.error("Could not open video stream: %s", feed_url)
                 return frames
 
-            # Get video properties
             fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
             logger.info("Stream opened: fps=%.1f, feed_id=%d", fps, feed_id)
 
             for i in range(num_frames):
-                # Skip frames to reach the desired position
                 if i > 0:
-                    frames_to_skip = int(fps * frame_interval_seconds)
-                    for _ in range(frames_to_skip):
-                        cap.grab()
+                    # Sleep between frames instead of burning through grab() calls.
+                    # For live streams this naturally advances to a later moment in
+                    # the broadcast without any seek overhead.
+                    time.sleep(frame_interval_seconds)
+
+                # Discard a few buffered frames so we get a fresh one from the
+                # live edge rather than something that has been sitting in the
+                # decoder buffer.
+                for _ in range(3):
+                    cap.grab()
 
                 ret, frame = cap.read()
                 if not ret or frame is None:
-                    logger.warning("Failed to read frame %d/%d from %s", i + 1, num_frames, feed_url)
+                    logger.warning(
+                        "Failed to read frame %d/%d from %s", i + 1, num_frames, feed_url
+                    )
                     continue
 
-                # Convert BGR to RGB
+                # Convert BGR → RGB
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                # Resize to max 1280x720 to reduce API costs
+                # Resize to max 1280×720 to reduce API costs
                 frame_rgb = self._resize_frame(frame_rgb, max_width=1280, max_height=720)
 
                 # Encode as JPEG
@@ -155,7 +180,9 @@ class VideoCapture:
                 )
 
                 frames.append((jpeg_bytes, blob_url))
-                logger.debug("Captured frame %d/%d for feed_id=%d", i + 1, num_frames, feed_id)
+                logger.debug(
+                    "Captured frame %d/%d for feed_id=%d", i + 1, num_frames, feed_id
+                )
 
         except Exception as e:
             logger.error("Frame capture error for feed_id=%d: %s", feed_id, e)
@@ -203,7 +230,7 @@ class VideoCapture:
         frame_index: int,
     ) -> str:
         """Upload a frame to Azure Blob Storage and return the blob URL."""
-        # Blob path: video-frames/feed_{id}/YYYY/MM/DD/HH/YYYYMMDD_HHMM_{frame}.jpg
+        # Blob path: video-frames/feed_{id}/YYYY/MM/DD/HH/YYYYMMDD_HHMM_frame{NN}.jpg
         date_path = interval_start.strftime("%Y/%m/%d/%H")
         timestamp_str = interval_start.strftime("%Y%m%d_%H%M")
         blob_name = f"feed_{feed_id}/{date_path}/{timestamp_str}_frame{frame_index:02d}.jpg"
@@ -218,9 +245,11 @@ class VideoCapture:
                 content_settings=ContentSettings(content_type="image/jpeg"),
             )
 
-            # Return the blob URL (without SAS - access via managed identity)
             account_name = self._settings.storage_account_name
-            blob_url = f"https://{account_name}.blob.core.windows.net/{self._container}/{blob_name}"
+            blob_url = (
+                f"https://{account_name}.blob.core.windows.net"
+                f"/{self._container}/{blob_name}"
+            )
             return blob_url
 
         except Exception as e:

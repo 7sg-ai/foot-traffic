@@ -123,7 +123,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             feed_id=feed_id,
             interval_start=interval_start,
             num_frames=num_frames,
-            frame_interval_seconds=30.0,
+            frame_interval_seconds=10.0,
         )
 
         if not frames:

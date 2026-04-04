@@ -95,7 +95,11 @@ def main(mytimer: func.TimerRequest) -> None:
                 feed_id=feed.feed_id,
                 interval_start=interval_start,
                 num_frames=settings.frames_per_interval,
-                frame_interval_seconds=60.0,  # 1 frame per minute across 5-min window
+                # 10 s sleep between frames: 5 frames × 10 s = ~50 s total capture
+                # time, well within the 10-min function timeout.  The old value of
+                # 60 s caused the function to burn through thousands of cap.grab()
+                # calls trying to skip video, which timed out on live HLS streams.
+                frame_interval_seconds=10.0,
             )
 
             total_frames += len(frames)

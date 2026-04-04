@@ -5,7 +5,7 @@ azure-keyvault-secrets==4.8.0
 azure-identity==1.16.1
 openai==1.109.1
 httpx>=0.28.0
-yt-dlp==2024.5.27
+yt-dlp>=2025.1.15
 opencv-python-headless==4.10.0.84
 Pillow==10.3.0
 pyodbc==5.1.0

@@ -60,6 +60,14 @@ class VideoCapture:
             "extract_flat": False,
             # Do NOT seek to the beginning of a live stream — we want the live edge.
             "live_from_start": False,
+            # Bypass YouTube bot detection on Azure datacenter IPs.
+            # tv_embedded and android clients do not require sign-in and work
+            # from server IPs where the default web client is bot-blocked.
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["tv_embedded", "android"],
+                }
+            },
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:

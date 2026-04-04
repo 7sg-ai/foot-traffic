@@ -1,0 +1,44 @@
+{
+  "feeds": [
+    {
+      "feed_id": 1,
+      "feed_name": "Times Square NYC Live",
+      "feed_url": "https://www.youtube.com/watch?v=rnXIjl_Rzy4",
+      "location_name": "Times Square, New York, NY",
+      "latitude": 40.7580,
+      "longitude": -73.9855,
+      "timezone": "America/New_York",
+      "is_active": true,
+      "notes": "EarthCam Live: Times Square in 4K - 24/7 live stream"
+    },
+    {
+      "feed_id": 2,
+      "feed_name": "Abbey Road Crossing London",
+      "feed_url": "https://www.youtube.com/watch?v=M3EYAY2MftI",
+      "location_name": "Abbey Road Crossing, London, UK",
+      "latitude": 51.5320,
+      "longitude": -0.1778,
+      "timezone": "Europe/London",
+      "is_active": true,
+      "notes": "EarthCam Live: Abbey Road Crossing - 24/7 live stream (replaced Piccadilly Circus which went offline)"
+    },
+    {
+      "feed_id": 3,
+      "feed_name": "Shibuya Crossing Tokyo",
+      "feed_url": "https://www.youtube.com/watch?v=3Q5wZeTuttw",
+      "location_name": "Shibuya Crossing, Tokyo, Japan",
+      "latitude": 35.6595,
+      "longitude": 139.7004,
+      "timezone": "Asia/Tokyo",
+      "is_active": true,
+      "notes": "Shibuya Sky Live Camera - official 24/7 stream from observation deck"
+    }
+  ],
+  "settings": {
+    "frames_per_interval": 5,
+    "frame_interval_seconds": 60,
+    "max_persons_per_frame": 20,
+    "confidence_threshold": 0.6,
+    "analysis_schedule_cron": "0 */5 * * * *"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "baseName": {
+      "value": "foottraffic"
+    },
+    "location": {
+      "value": "westus3"
+    },
+    "cognitiveServicesLocation": {
+      "value": "eastus2"
+    },
+    "environment": {
+      "value": "prod"
+    },
+    "openAiModelDeploymentName": {
+      "value": "gpt-5.3-chat"
+    },
+    "openAiModelVersion": {
+      "value": "2025-02-01"
+    },
+    "synapseSqlAdminUser": {
+      "value": "sqladmin"
+    },
+    "videoFeedUrls": {
+      "value": "https://www.youtube.com/watch?v=rnCTiKOB6Ks,https://www.youtube.com/watch?v=AdUw5RdyZxI,https://www.youtube.com/watch?v=3HBsHMFRFpo"
+    }
+  }
+}

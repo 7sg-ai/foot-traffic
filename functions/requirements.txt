@@ -1,0 +1,16 @@
+azure-functions==1.21.3
+azure-storage-blob==12.19.1
+azure-servicebus==7.12.1
+azure-keyvault-secrets==4.8.0
+azure-identity==1.16.1
+openai==1.109.1
+httpx>=0.28.0
+yt-dlp==2024.5.27
+opencv-python-headless==4.10.0.84
+Pillow==10.3.0
+pyodbc==5.1.0
+numpy==1.26.4
+requests==2.32.3
+tenacity==8.3.0
+pydantic==2.7.4
+python-dateutil==2.9.0

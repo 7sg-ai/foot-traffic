@@ -1,0 +1,61 @@
+# =============================================================================
+# Azure Developer CLI (azd) manifest
+# https://learn.microsoft.com/en-us/azure/developer/azure-developer-cli/
+#
+# Usage:
+#   azd init        # Initialize environment
+#   azd up          # Provision + deploy everything
+#   azd provision   # Infrastructure only
+#   azd deploy      # Application code only
+#   azd down        # Tear down all resources
+# =============================================================================
+
+name: foot-traffic-analyzer
+
+metadata:
+  template: foot-traffic-analyzer@0.1.0
+
+# ─── Infrastructure ──────────────────────────────────────────────────────────
+infra:
+  provider: bicep
+  path: infrastructure
+  module: main
+
+# ─── Services ────────────────────────────────────────────────────────────────
+services:
+
+  # Azure Functions - Video analysis scheduler + Service Bus trigger
+  # Runs the Functions host inside a container on Azure Container Apps.
+  # No App Service Plan / Y1 quota required.
+  video-analyzer:
+    project: functions
+    language: python
+    host: containerapp
+    docker:
+      path: Dockerfile
+      context: .
+
+  # Streamlit Dashboard - Container App
+  streamlit-dashboard:
+    project: streamlit_app
+    language: python
+    host: containerapp
+    docker:
+      path: Dockerfile
+      context: .
+
+# ─── Hooks ───────────────────────────────────────────────────────────────────
+hooks:
+  # Run after infrastructure is provisioned
+  postprovision:
+    shell: sh
+    run: scripts/postprovision.sh
+    interactive: true
+    continueOnError: false
+
+  # Run after all services are deployed
+  postdeploy:
+    shell: sh
+    run: scripts/postdeploy.sh
+    interactive: false
+    continueOnError: true

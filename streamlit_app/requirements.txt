@@ -1,0 +1,9 @@
+streamlit==1.35.0
+pandas==2.2.2
+plotly==5.22.0
+pyodbc==5.1.0
+openai==1.35.7
+tenacity==8.3.0
+python-dateutil==2.9.0
+numpy==1.26.4
+statsmodels==0.14.2

@@ -117,7 +117,20 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         results["blob_storage"] = f"FAIL: {e}"
 
-    logger.info("Diag complete: %s", json.dumps(results, default=str))
+    output = json.dumps(results, indent=2, default=str)
+    logger.info("Diag complete: %s", output)
+
+    # Always write to blob storage so we can read it even without HTTP access
+    try:
+        conn_str = os.environ.get("STORAGE_CONNECTION_STRING", "")
+        if conn_str:
+            from azure.storage.blob import BlobServiceClient
+            client = BlobServiceClient.from_connection_string(conn_str)
+            blob = client.get_blob_client("video-frames", "diag-output.json")
+            blob.upload_blob(output.encode(), overwrite=True)
+            results["_blob_upload"] = "OK: video-frames/diag-output.json"
+    except Exception as e:
+        results["_blob_upload"] = f"FAIL: {e}"
 
     return func.HttpResponse(
         json.dumps(results, indent=2, default=str),

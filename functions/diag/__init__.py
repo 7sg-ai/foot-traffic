@@ -1,11 +1,11 @@
 """
 Azure Function: diag
-HTTP-triggered diagnostic function. Tests all dependencies and writes results to blob.
+Timer-triggered diagnostic function (runOnStartup=true).
+Runs once on startup, tests all dependencies, writes results to blob storage.
 """
 import json
 import logging
 import os
-import sys
 import traceback
 
 import azure.functions as func
@@ -13,7 +13,7 @@ import azure.functions as func
 logger = logging.getLogger(__name__)
 
 
-def main(req: func.HttpRequest) -> func.HttpResponse:
+def main(mytimer: func.TimerRequest) -> None:
     results = {}
 
     # Test imports
@@ -31,11 +31,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         results["odbc_drivers"] = f"FAIL: {e}"
 
-    # Env vars (masked)
+    # Env vars
     for var in ["STORAGE_CONNECTION_STRING", "STORAGE_ACCOUNT_NAME", "SYNAPSE_SERVER",
                 "VIDEO_FEED_URLS", "AZURE_OPENAI_ENDPOINT", "FUNCTIONS_WORKER_RUNTIME"]:
         val = os.environ.get(var, "NOT SET")
-        results[f"env_{var}"] = val[:60] + "..." if len(val) > 60 else val
+        results[f"env_{var}"] = (val[:60] + "...") if len(val) > 60 else val
 
     # yt-dlp URL resolution
     try:
@@ -89,7 +89,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM traffic.analysis_jobs")
             count = cursor.fetchone()[0]
-            cursor.execute("SELECT TOP 3 status, frames_captured, error_message, started_at FROM traffic.analysis_jobs ORDER BY started_at DESC")
+            cursor.execute(
+                "SELECT TOP 3 status, frames_captured, "
+                "CAST(error_message AS VARCHAR(200)) as err, started_at "
+                "FROM traffic.analysis_jobs ORDER BY started_at DESC"
+            )
             rows = [str(r) for r in cursor.fetchall()]
             conn.close()
             results["synapse_connection"] = "OK"
@@ -108,7 +112,6 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             client = BlobServiceClient.from_connection_string(conn_str)
             containers = [c.name for c in client.list_containers()]
             results["blob_storage"] = f"OK containers={containers}"
-            # Count blobs in video-frames
             container_client = client.get_container_client("video-frames")
             blobs = list(container_client.list_blobs())
             results["video_frames_blob_count"] = len(blobs)
@@ -120,7 +123,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     output = json.dumps(results, indent=2, default=str)
     logger.info("Diag complete: %s", output)
 
-    # Always write to blob storage so we can read it even without HTTP access
+    # Write to blob storage
     try:
         conn_str = os.environ.get("STORAGE_CONNECTION_STRING", "")
         if conn_str:
@@ -128,12 +131,6 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             client = BlobServiceClient.from_connection_string(conn_str)
             blob = client.get_blob_client("video-frames", "diag-output.json")
             blob.upload_blob(output.encode(), overwrite=True)
-            results["_blob_upload"] = "OK: video-frames/diag-output.json"
+            logger.info("Diag output uploaded to video-frames/diag-output.json")
     except Exception as e:
-        results["_blob_upload"] = f"FAIL: {e}"
-
-    return func.HttpResponse(
-        json.dumps(results, indent=2, default=str),
-        status_code=200,
-        mimetype="application/json",
-    )
+        logger.error("Diag blob upload failed: %s", e)

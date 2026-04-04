@@ -2,16 +2,12 @@
   "scriptFile": "__init__.py",
   "bindings": [
     {
-      "authLevel": "anonymous",
-      "type": "httpTrigger",
+      "name": "mytimer",
+      "type": "timerTrigger",
       "direction": "in",
-      "name": "req",
-      "methods": ["get"]
-    },
-    {
-      "type": "http",
-      "direction": "out",
-      "name": "$return"
+      "schedule": "0 0 0 1 1 0",
+      "runOnStartup": true,
+      "useMonitor": false
     }
   ]
 }

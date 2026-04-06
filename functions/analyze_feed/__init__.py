@@ -165,6 +165,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 
         duration = time.time() - job_start
 
+        # Sum tokens from each frame result for this job only — do NOT use
+        # analyzer.total_tokens_used which is a lifetime cumulative counter
+        # that grows across all invocations for the process lifetime.
+        tokens_used = sum(r.tokens_this_call for r in frame_results)
+
         # Log job
         db.log_analysis_job(
             job_id=job_id,
@@ -174,7 +179,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             frames_captured=len(frames),
             persons_detected=total_persons,
             vlm_calls_made=len(frames),
-            total_tokens_used=analyzer.total_tokens_used,
+            total_tokens_used=tokens_used,
             duration_seconds=duration,
         )
 
@@ -188,7 +193,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "interval_end": interval_end.isoformat(),
             "frames_captured": len(frames),
             "persons_detected": total_persons,
-            "tokens_used": analyzer.total_tokens_used,
+            "tokens_used": tokens_used,
             "duration_seconds": round(duration, 2),
             "aggregate": {
                 "total_count": aggregate.total_count,

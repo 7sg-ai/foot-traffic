@@ -111,6 +111,8 @@ class VLMAnalyzer:
         # errors at startup when OpenAI env vars may not yet be available.
         self._client: Optional[AzureOpenAI] = None
         self._deployment = self._settings.openai_deployment
+        # Lifetime cumulative counter — use tokens_this_call on FrameAnalysisResult
+        # for per-job accounting instead of reading this directly.
         self._total_tokens_used = 0
 
     def _get_client(self) -> AzureOpenAI:
@@ -132,6 +134,7 @@ class VLMAnalyzer:
 
     @property
     def total_tokens_used(self) -> int:
+        """Lifetime cumulative token counter across all calls since process start."""
         return self._total_tokens_used
 
     def encode_image_bytes(self, image_bytes: bytes) -> str:
@@ -212,9 +215,19 @@ class VLMAnalyzer:
                 temperature=0.1,  # Low temperature for consistent categorization
             )
 
-            # Track token usage
-            if response.usage:
-                self._total_tokens_used += response.usage.total_tokens
+            # Track token usage — store on the result so callers can sum per-job
+            # totals without relying on the singleton's lifetime counter.
+            tokens_this_call = response.usage.total_tokens if response.usage else 0
+            if tokens_this_call == 0:
+                # usage can be None or zero for some Azure OpenAI API versions;
+                # log so we can detect the issue without silently dropping counts.
+                logger.warning(
+                    "VLM response.usage is %s for feed_id=%d — token count will be 0 for this call",
+                    response.usage,
+                    feed_id,
+                )
+            self._total_tokens_used += tokens_this_call
+            result.tokens_this_call = tokens_this_call
 
             raw_response = response.choices[0].message.content
             result.vlm_raw_response = raw_response
@@ -253,15 +266,27 @@ class VLMAnalyzer:
             result.time_of_day = parsed.get("time_of_day")
             result.crowd_density = parsed.get("crowd_density")
 
-            logger.info(
-                "VLM analysis complete: feed_id=%d, persons=%d, tokens=%d",
-                feed_id,
-                len(persons),
-                response.usage.total_tokens if response.usage else 0,
-            )
+            if len(persons) == 0:
+                logger.warning(
+                    "VLM returned 0 persons for feed_id=%d — raw response: %.500s",
+                    feed_id,
+                    raw_response,
+                )
+            else:
+                logger.info(
+                    "VLM analysis complete: feed_id=%d, persons=%d, tokens=%d",
+                    feed_id,
+                    len(persons),
+                    tokens_this_call,
+                )
 
         except json.JSONDecodeError as e:
-            logger.error("Failed to parse VLM JSON response: %s", e)
+            logger.error(
+                "Failed to parse VLM JSON response for feed_id=%d: %s — raw: %.500s",
+                feed_id,
+                e,
+                result.vlm_raw_response or "<no response captured>",
+            )
             result.error = f"JSON parse error: {e}"
         except Exception as e:
             logger.error("VLM analysis failed: %s", e)

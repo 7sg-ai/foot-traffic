@@ -22,8 +22,13 @@ from shared.db_client import get_db_client
 from shared.video_capture import get_video_capture
 from shared.vlm_analyzer import get_vlm_analyzer
 from shared.models import IntervalAggregate
+from shared.reprocessor import run_startup_reprocessing
 
 logger = logging.getLogger(__name__)
+
+# Module-level flag: reprocessing runs exactly once per container lifecycle
+# (i.e. on the first timer invocation after a cold start / restart).
+_startup_reprocessing_done: bool = False
 
 
 def main(mytimer: func.TimerRequest) -> None:
@@ -56,6 +61,20 @@ def main(mytimer: func.TimerRequest) -> None:
     db = get_db_client()
     capturer = get_video_capture()
     analyzer = get_vlm_analyzer()
+
+    # ── Startup reprocessing ──────────────────────────────────────────────────
+    # On the first timer invocation after a container cold-start / restart,
+    # re-analyze any frames that previously returned 0 people detected.
+    # This ensures improvements to the VLM model or prompt benefit past data.
+    global _startup_reprocessing_done
+    if not _startup_reprocessing_done:
+        _startup_reprocessing_done = True  # set before call so a crash doesn't loop
+        logger.info("Container (re)started — running startup reprocessing of zero-person frames")
+        try:
+            run_startup_reprocessing(db=db, analyzer=analyzer)
+        except Exception as e:
+            # Non-fatal: log and continue with normal scheduling
+            logger.error("Startup reprocessing encountered an unexpected error: %s", e)
 
     # Get active feeds from database — the single source of truth.
     # No env var fallback: feed management belongs in the DB.
@@ -145,8 +164,11 @@ def main(mytimer: func.TimerRequest) -> None:
 
             # Step 5: Log job success
             job_duration = time.time() - job_start
-            tokens_used = analyzer.total_tokens_used
-            total_tokens = tokens_used
+            # Sum tokens from each frame result for this job only — do NOT use
+            # analyzer.total_tokens_used which is a lifetime cumulative counter
+            # that grows across all timer invocations for the process lifetime.
+            tokens_used = sum(r.tokens_this_call for r in frame_results)
+            total_tokens += tokens_used
 
             db.log_analysis_job(
                 job_id=job_id,

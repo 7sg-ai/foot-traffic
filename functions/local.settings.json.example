@@ -25,6 +25,9 @@
     "MAX_PERSONS_PER_FRAME": "10",
     "CONFIDENCE_THRESHOLD": "0.6",
 
+    "REPROCESS_MAX_FRAMES": "50",
+    "REPROCESS_LOOKBACK_DAYS": "7",
+
     "KEY_VAULT_URI": "https://your-keyvault.vault.azure.net/"
   },
   "Host": {

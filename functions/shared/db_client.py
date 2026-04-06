@@ -15,7 +15,7 @@ import pyodbc
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from .config import get_settings
-from .models import IntervalAggregate, FrameAnalysisResult, VideoFeed
+from .models import IntervalAggregate, FrameAnalysisResult, VideoFeed, ZeroPersonFrame
 
 logger = logging.getLogger(__name__)
 
@@ -49,92 +49,23 @@ class SynapseClient:
         retry=retry_if_exception_type(pyodbc.OperationalError),
     )
     def insert_interval_aggregate(self, agg: IntervalAggregate) -> None:
-        """Insert or update a 5-minute interval aggregate."""
-        sql = """
-        MERGE traffic.interval_aggregates AS target
-        USING (
-            SELECT
-                :feed_id AS feed_id,
-                :interval_start AS interval_start
-        ) AS source
-        ON target.feed_id = source.feed_id
-           AND target.interval_start = source.interval_start
-        WHEN MATCHED THEN
-            UPDATE SET
-                interval_end            = ?,
-                total_count             = ?,
-                frames_analyzed         = ?,
-                count_male              = ?,
-                count_female            = ?,
-                count_gender_unknown    = ?,
-                count_children          = ?,
-                count_teens             = ?,
-                count_young_adults      = ?,
-                count_adults            = ?,
-                count_seniors           = ?,
-                avg_estimated_age       = ?,
-                ethnicity_breakdown     = ?,
-                count_business_attire   = ?,
-                count_casual_attire     = ?,
-                count_athletic_attire   = ?,
-                count_uniform_attire    = ?,
-                count_working           = ?,
-                count_leisure           = ?,
-                count_walking           = ?,
-                count_running           = ?,
-                count_standing          = ?,
-                count_cycling           = ?,
-                count_shopping          = ?,
-                count_using_phone       = ?,
-                count_carrying_items    = ?,
-                count_in_groups         = ?,
-                pct_male                = ?,
-                pct_female              = ?,
-                pct_working             = ?,
-                pct_using_phone         = ?,
-                avg_confidence_score    = ?,
-                processing_status       = ?,
-                error_message           = ?,
-                updated_at              = GETUTCDATE()
-        WHEN NOT MATCHED THEN
-            INSERT (
-                aggregate_id, feed_id, interval_start, interval_end,
-                total_count, frames_analyzed,
-                count_male, count_female, count_gender_unknown,
-                count_children, count_teens, count_young_adults, count_adults, count_seniors,
-                avg_estimated_age, ethnicity_breakdown,
-                count_business_attire, count_casual_attire, count_athletic_attire, count_uniform_attire,
-                count_working, count_leisure,
-                count_walking, count_running, count_standing, count_cycling, count_shopping,
-                count_using_phone, count_carrying_items, count_in_groups,
-                pct_male, pct_female, pct_working, pct_using_phone,
-                avg_confidence_score, processing_status, error_message
-            )
-            VALUES (
-                ?, ?, ?, ?,
-                ?, ?,
-                ?, ?, ?,
-                ?, ?, ?, ?, ?,
-                ?, ?,
-                ?, ?, ?, ?,
-                ?, ?,
-                ?, ?, ?, ?, ?,
-                ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?
-            );
-        """
-        # Synapse doesn't support MERGE with named params via pyodbc the same way,
-        # so we use a simpler INSERT with duplicate check approach:
+        """Insert or update a 5-minute interval aggregate (DELETE + INSERT upsert)."""
         self._upsert_interval_aggregate(agg)
 
     def _upsert_interval_aggregate(self, agg: IntervalAggregate) -> None:
-        """Upsert interval aggregate using DELETE + INSERT pattern (Synapse compatible)."""
+        """Upsert interval aggregate using DELETE + INSERT pattern (Synapse compatible).
+
+        Synapse Dedicated SQL Pool does not support MERGE with pyodbc named params,
+        and INSERT ... VALUES does not allow function calls (e.g. GETUTCDATE()).
+        We use INSERT ... SELECT so that GETUTCDATE() is evaluated server-side.
+        """
         delete_sql = """
         DELETE FROM traffic.interval_aggregates
         WHERE feed_id = ? AND interval_start = ?
         """
 
+        # INSERT ... SELECT allows GETUTCDATE() for created_at / updated_at.
+        # Column order must exactly match the SELECT column order.
         insert_sql = """
         INSERT INTO traffic.interval_aggregates (
             aggregate_id, feed_id, interval_start, interval_end,
@@ -147,23 +78,25 @@ class SynapseClient:
             count_walking, count_running, count_standing, count_cycling, count_shopping,
             count_using_phone, count_carrying_items, count_in_groups,
             pct_male, pct_female, pct_working, pct_using_phone,
-            avg_confidence_score, processing_status, error_message
-        ) VALUES (
-            ?, ?, ?, ?,
-            ?, ?,
-            ?, ?, ?,
-            ?, ?, ?, ?, ?,
-            ?, ?,
-            ?, ?, ?, ?,
-            ?, ?,
-            ?, ?, ?, ?, ?,
-            ?, ?, ?,
-            ?, ?, ?, ?,
-            ?, ?, ?
+            avg_confidence_score, processing_status, error_message,
+            created_at, updated_at
         )
+        SELECT
+            ?, ?, ?, ?,
+            ?, ?,
+            ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?,
+            ?, ?, ?, ?,
+            ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?,
+            GETUTCDATE(), GETUTCDATE()
         """
 
-        # Generate a numeric aggregate_id from a hash of feed_id + interval_start
+        # Generate a stable numeric aggregate_id from feed_id + interval_start
         agg_id = abs(hash(f"{agg.feed_id}_{agg.interval_start.isoformat()}")) % (10**15)
 
         params = (
@@ -219,17 +152,38 @@ class SynapseClient:
         )
 
     def insert_raw_observations(self, frame_result: FrameAnalysisResult) -> int:
-        """Insert raw person observations from a frame analysis. Returns count inserted."""
+        """Insert raw person observations from a frame analysis. Returns count inserted.
+
+        Uses INSERT ... SELECT so that GETUTCDATE() is evaluated server-side for
+        created_at (Synapse Dedicated SQL Pool does not allow function calls in VALUES).
+
+        When the VLM returns zero persons (but no error), we insert a single
+        sentinel row with NULL demographic fields so that:
+          1. The raw VLM response is preserved for debugging.
+          2. analysis_jobs.persons_detected correctly reflects 0 (not missing data).
+        """
         if not frame_result.persons:
+            # Still persist the raw response for zero-person frames so we can
+            # inspect what the model actually returned.
+            if frame_result.vlm_raw_response:
+                self._insert_zero_person_sentinel(frame_result)
             return 0
 
+        # INSERT ... SELECT allows GETUTCDATE() for created_at.
         insert_sql = """
         INSERT INTO traffic.raw_observations (
             observation_id, feed_id, captured_at, interval_start, frame_blob_url,
             gender, age_group, age_estimate_min, age_estimate_max, apparent_ethnicity,
             attire_type, is_working, activity, carrying_items, using_phone, group_size,
-            confidence_score, vlm_raw_response, processing_duration_ms, model_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            confidence_score, vlm_raw_response, processing_duration_ms, model_version,
+            created_at
+        )
+        SELECT
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            GETUTCDATE()
         """
 
         rows = []
@@ -273,6 +227,61 @@ class SynapseClient:
         )
         return len(rows)
 
+    def _insert_zero_person_sentinel(self, frame_result: FrameAnalysisResult) -> None:
+        """Insert a sentinel row for a frame where the VLM returned 0 persons.
+
+        All demographic fields are NULL; the raw VLM response is stored so we
+        can diagnose whether the model is genuinely seeing an empty scene or
+        returning a malformed / unexpected JSON structure.
+        """
+        insert_sql = """
+        INSERT INTO traffic.raw_observations (
+            observation_id, feed_id, captured_at, interval_start, frame_blob_url,
+            gender, age_group, age_estimate_min, age_estimate_max, apparent_ethnicity,
+            attire_type, is_working, activity, carrying_items, using_phone, group_size,
+            confidence_score, vlm_raw_response, processing_duration_ms, model_version,
+            created_at
+        )
+        SELECT
+            ?, ?, ?, ?, ?,
+            NULL, NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL, NULL,
+            NULL, ?, ?, ?,
+            GETUTCDATE()
+        """
+        obs_id = abs(hash(
+            f"{frame_result.feed_id}_{frame_result.captured_at.isoformat()}_sentinel"
+        )) % (10**15)
+
+        params = (
+            obs_id,
+            frame_result.feed_id,
+            frame_result.captured_at,
+            frame_result.interval_start,
+            frame_result.frame_blob_url,
+            frame_result.vlm_raw_response[:4000] if frame_result.vlm_raw_response else None,
+            frame_result.processing_duration_ms,
+            frame_result.model_version,
+        )
+
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(insert_sql, params)
+            logger.info(
+                "Inserted zero-person sentinel for feed_id=%d at %s (raw_response len=%d)",
+                frame_result.feed_id,
+                frame_result.captured_at.isoformat(),
+                len(frame_result.vlm_raw_response or ""),
+            )
+        except Exception as e:
+            # Non-fatal: log and continue — don't let diagnostic writes block the pipeline
+            logger.warning(
+                "Failed to insert zero-person sentinel for feed_id=%d: %s",
+                frame_result.feed_id,
+                e,
+            )
+
     def log_analysis_job(
         self,
         job_id: str,
@@ -286,23 +295,57 @@ class SynapseClient:
         duration_seconds: Optional[float] = None,
         error_message: Optional[str] = None,
     ) -> None:
-        """Log an analysis job record."""
-        sql = """
-        INSERT INTO traffic.analysis_jobs (
-            job_id, feed_id, interval_start, status,
-            frames_captured, persons_detected, vlm_calls_made, total_tokens_used,
-            duration_seconds, error_message, completed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """Log an analysis job record.
+
+        Uses INSERT ... SELECT so that GETUTCDATE() is evaluated server-side for
+        started_at (Synapse Dedicated SQL Pool does not allow function calls in VALUES).
+        completed_at is only set for terminal statuses (success / failed).
         """
         completed_at = datetime.utcnow() if status in ("success", "failed") else None
 
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(sql, (
+        if completed_at is not None:
+            sql = """
+            INSERT INTO traffic.analysis_jobs (
                 job_id, feed_id, interval_start, status,
                 frames_captured, persons_detected, vlm_calls_made, total_tokens_used,
-                duration_seconds, error_message, completed_at,
-            ))
+                duration_seconds, error_message,
+                started_at, completed_at
+            )
+            SELECT
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?,
+                GETUTCDATE(), ?
+            """
+            params = (
+                job_id, feed_id, interval_start, status,
+                frames_captured, persons_detected, vlm_calls_made, total_tokens_used,
+                duration_seconds, error_message,
+                completed_at,
+            )
+        else:
+            sql = """
+            INSERT INTO traffic.analysis_jobs (
+                job_id, feed_id, interval_start, status,
+                frames_captured, persons_detected, vlm_calls_made, total_tokens_used,
+                duration_seconds, error_message,
+                started_at
+            )
+            SELECT
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?,
+                GETUTCDATE()
+            """
+            params = (
+                job_id, feed_id, interval_start, status,
+                frames_captured, persons_detected, vlm_calls_made, total_tokens_used,
+                duration_seconds, error_message,
+            )
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
 
     def get_active_feeds(self) -> list[VideoFeed]:
         """Retrieve all active video feeds."""
@@ -383,6 +426,206 @@ class SynapseClient:
             rows = cursor.fetchall()
 
         return [dict(zip(columns, row)) for row in rows]
+
+    def get_zero_person_frames(
+        self,
+        lookback_days: int = 7,
+        limit: int = 50,
+    ) -> list:
+        """Return sentinel rows for frames where the VLM detected 0 persons.
+
+        Sentinel rows are identified by gender IS NULL (all demographic fields
+        are NULL) and frame_blob_url IS NOT NULL.  We exclude frames that have
+        no stored blob — those cannot be reprocessed.
+
+        Returns a list of ZeroPersonFrame objects ordered oldest-first so we
+        reprocess the most stale data first.
+        """
+        cutoff = __import__("datetime").datetime.utcnow() - __import__("datetime").timedelta(days=lookback_days)
+
+        sql = f"""
+        SELECT TOP {limit}
+            feed_id,
+            captured_at,
+            interval_start,
+            frame_blob_url
+        FROM traffic.raw_observations
+        WHERE gender IS NULL
+          AND frame_blob_url IS NOT NULL
+          AND frame_blob_url <> ''
+          AND captured_at >= ?
+        ORDER BY captured_at ASC
+        """
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, (cutoff,))
+            rows = cursor.fetchall()
+
+        result = [
+            ZeroPersonFrame(
+                feed_id=row[0],
+                captured_at=row[1],
+                interval_start=row[2],
+                frame_blob_url=row[3],
+            )
+            for row in rows
+        ]
+
+        logger.info(
+            "get_zero_person_frames: found %d sentinel rows (lookback=%d days, limit=%d)",
+            len(result),
+            lookback_days,
+            limit,
+        )
+        return result
+
+    def delete_zero_person_sentinel(
+        self,
+        feed_id: int,
+        captured_at,
+    ) -> None:
+        """Delete the sentinel row(s) for a specific frame before reprocessing.
+
+        Matches on feed_id + captured_at + gender IS NULL to avoid accidentally
+        removing real observations.
+        """
+        sql = """
+        DELETE FROM traffic.raw_observations
+        WHERE feed_id = ?
+          AND captured_at = ?
+          AND gender IS NULL
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, (feed_id, captured_at))
+
+        logger.info(
+            "Deleted zero-person sentinel for feed_id=%d captured_at=%s",
+            feed_id,
+            captured_at,
+        )
+
+    def get_frame_results_for_interval(
+        self,
+        feed_id: int,
+        interval_start,
+    ) -> list:
+        """Reconstruct FrameAnalysisResult objects from raw_observations for an interval.
+
+        Used when rebuilding an interval aggregate after reprocessing.  Only
+        non-sentinel rows (gender IS NOT NULL) are included — sentinel rows
+        represent zero-person frames and contribute 0 to the aggregate.
+
+        Returns a list of FrameAnalysisResult objects (one per distinct
+        captured_at timestamp that has at least one real observation).
+        """
+        from .models import FrameAnalysisResult, PersonObservation
+
+        sql = """
+        SELECT
+            captured_at,
+            frame_blob_url,
+            gender,
+            age_group,
+            age_estimate_min,
+            age_estimate_max,
+            apparent_ethnicity,
+            attire_type,
+            is_working,
+            activity,
+            carrying_items,
+            using_phone,
+            group_size,
+            confidence_score,
+            vlm_raw_response,
+            processing_duration_ms,
+            model_version
+        FROM traffic.raw_observations
+        WHERE feed_id = ?
+          AND interval_start = ?
+          AND gender IS NOT NULL
+        ORDER BY captured_at ASC
+        """
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, (feed_id, interval_start))
+            rows = cursor.fetchall()
+
+        # Group rows by captured_at to reconstruct per-frame results
+        from collections import defaultdict
+        frames_map: dict = defaultdict(list)
+        meta_map: dict = {}
+
+        for row in rows:
+            (
+                captured_at, frame_blob_url,
+                gender, age_group, age_estimate_min, age_estimate_max,
+                apparent_ethnicity, attire_type, is_working, activity,
+                carrying_items, using_phone, group_size, confidence_score,
+                vlm_raw_response, processing_duration_ms, model_version,
+            ) = row
+
+            key = captured_at
+            if key not in meta_map:
+                meta_map[key] = {
+                    "frame_blob_url": frame_blob_url,
+                    "vlm_raw_response": vlm_raw_response,
+                    "processing_duration_ms": processing_duration_ms or 0,
+                    "model_version": model_version or "",
+                }
+
+            person_index = len(frames_map[key]) + 1
+            try:
+                person = PersonObservation(
+                    person_index=person_index,
+                    gender=gender,
+                    age_group=age_group,
+                    age_estimate_min=age_estimate_min,
+                    age_estimate_max=age_estimate_max,
+                    apparent_ethnicity=apparent_ethnicity,
+                    attire_type=attire_type,
+                    is_working=bool(is_working) if is_working is not None else None,
+                    activity=activity,
+                    carrying_items=bool(carrying_items) if carrying_items is not None else None,
+                    using_phone=bool(using_phone) if using_phone is not None else None,
+                    group_size=group_size,
+                    confidence_score=float(confidence_score) if confidence_score is not None else 0.7,
+                )
+                frames_map[key].append(person)
+            except Exception as e:
+                logger.warning(
+                    "Skipping malformed observation row for feed_id=%d captured_at=%s: %s",
+                    feed_id, captured_at, e,
+                )
+
+        frame_results = []
+        for captured_at, persons in frames_map.items():
+            meta = meta_map[captured_at]
+            frame_results.append(
+                FrameAnalysisResult(
+                    feed_id=feed_id,
+                    feed_url="",
+                    captured_at=captured_at,
+                    interval_start=interval_start,
+                    frame_blob_url=meta["frame_blob_url"],
+                    persons=persons,
+                    total_persons_detected=len(persons),
+                    vlm_raw_response=meta["vlm_raw_response"],
+                    processing_duration_ms=meta["processing_duration_ms"],
+                    model_version=meta["model_version"],
+                )
+            )
+
+        logger.info(
+            "get_frame_results_for_interval: feed_id=%d interval=%s → %d frames, %d persons",
+            feed_id,
+            interval_start,
+            len(frame_results),
+            sum(len(fr.persons) for fr in frame_results),
+        )
+        return frame_results
 
     def execute_custom_query(self, sql: str, params: Optional[list] = None) -> list[dict]:
         """Execute a custom SQL query and return results as list of dicts."""

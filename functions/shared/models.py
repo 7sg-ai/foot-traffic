@@ -96,6 +96,7 @@ class FrameAnalysisResult(BaseModel):
     processing_duration_ms: int = 0
     model_version: str = "gpt-5.3-chat"
     vlm_raw_response: Optional[str] = None
+    tokens_this_call: int = 0  # tokens used for this specific frame's VLM call
     error: Optional[str] = None
 
     @property
@@ -289,3 +290,26 @@ class VideoFeed(BaseModel):
     longitude: Optional[float] = None
     timezone: str = "UTC"
     is_active: bool = True
+
+
+class ZeroPersonFrame:
+    """Lightweight container for a zero-person sentinel row from raw_observations.
+
+    Represents a frame that was previously analyzed by the VLM but returned
+    0 people detected.  Used by the reprocessor to identify frames that should
+    be re-analyzed after a container restart.
+    """
+
+    __slots__ = ("feed_id", "captured_at", "interval_start", "frame_blob_url")
+
+    def __init__(
+        self,
+        feed_id: int,
+        captured_at: datetime,
+        interval_start: datetime,
+        frame_blob_url: str,
+    ) -> None:
+        self.feed_id = feed_id
+        self.captured_at = captured_at
+        self.interval_start = interval_start
+        self.frame_blob_url = frame_blob_url

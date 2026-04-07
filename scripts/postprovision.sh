@@ -54,11 +54,23 @@ if [[ -z "$SYNAPSE_WORKSPACE" && -n "$RESOURCE_GROUP" ]]; then
   [[ -n "$SYNAPSE_WORKSPACE" ]] && log "  Found Synapse workspace: $SYNAPSE_WORKSPACE"
 fi
 
+# Storage account name — azd injects Bicep output 'storageAccountName' as-is in .env
+# (azd does NOT uppercase output names — they appear exactly as declared in Bicep)
+STORAGE_ACCOUNT_NAME="${storageAccountName:-}"
+if [[ -z "$STORAGE_ACCOUNT_NAME" && -n "$RESOURCE_GROUP" ]]; then
+  log "storageAccountName not set — looking up storage account from resource group..."
+  # Exclude the Synapse ADLS account (name starts with 'syn')
+  STORAGE_ACCOUNT_NAME=$(az storage account list --resource-group "$RESOURCE_GROUP" \
+    --query "[?starts_with(name,'stg')].name | [0]" -o tsv 2>/dev/null || echo "")
+  [[ -n "$STORAGE_ACCOUNT_NAME" ]] && log "  Found storage account: $STORAGE_ACCOUNT_NAME"
+fi
+
 log "Post-provision setup starting..."
 log "  OpenAI Account:    ${OPENAI_ACCOUNT_NAME:-<not set>}"
 log "  Model Deployment:  ${OPENAI_DEPLOYMENT_NAME} (${OPENAI_MODEL_NAME} ${OPENAI_MODEL_VERSION})"
 log "  Synapse Workspace: ${SYNAPSE_WORKSPACE:-<not set>}"
 log "  Resource Group:    ${RESOURCE_GROUP:-<not set>}"
+log "  Storage Account:   ${STORAGE_ACCOUNT_NAME:-<not set>}"
 echo ""
 
 # =============================================================================
@@ -193,85 +205,172 @@ fi
 
 # =============================================================================
 # STEP 3: Wait for Synapse SQL Pool + Initialize Schema
+# Wrapped in a function so early returns don't skip STEP 4 (reference frames).
 # =============================================================================
-if [[ -z "$SYNAPSE_WORKSPACE" ]]; then
-  warn "AZURE_SYNAPSE_WORKSPACE_NAME not set — skipping schema init."
-  exit 0
-fi
-
-log "Waiting for Synapse SQL pool '$SYNAPSE_SQL_POOL' to come online..."
-log "(This can take 5-10 minutes on first provision)"
-MAX_WAIT=60
-for i in $(seq 1 $MAX_WAIT); do
-  STATUS=$(az synapse sql pool show \
-    --workspace-name "$SYNAPSE_WORKSPACE" \
-    --name "$SYNAPSE_SQL_POOL" \
-    --resource-group "$RESOURCE_GROUP" \
-    --query "status" -o tsv 2>/dev/null || echo "Unknown")
-
-  if [[ "$STATUS" == "Online" ]]; then
-    success "SQL pool is online"
-    break
+init_schema() {
+  if [[ -z "$SYNAPSE_WORKSPACE" ]]; then
+    warn "AZURE_SYNAPSE_WORKSPACE_NAME not set — skipping schema init."
+    return
   fi
 
-  if [[ $i -eq $MAX_WAIT ]]; then
-    warn "SQL pool not ready after $((MAX_WAIT * 10))s."
-    warn "Run schema manually once the pool is online:"
-    warn "  sqlcmd -S ${SYNAPSE_WORKSPACE}.sql.azuresynapse.net -d $SYNAPSE_SQL_POOL -U sqladmin -P <from-keyvault> -i database/schema.sql -I"
-    exit 0
+  log "Waiting for Synapse SQL pool '$SYNAPSE_SQL_POOL' to come online..."
+  log "(This can take 5-10 minutes on first provision)"
+  local MAX_WAIT=60
+  for i in $(seq 1 $MAX_WAIT); do
+    STATUS=$(az synapse sql pool show \
+      --workspace-name "$SYNAPSE_WORKSPACE" \
+      --name "$SYNAPSE_SQL_POOL" \
+      --resource-group "$RESOURCE_GROUP" \
+      --query "status" -o tsv 2>/dev/null || echo "Unknown")
+
+    if [[ "$STATUS" == "Online" ]]; then
+      success "SQL pool is online"
+      break
+    fi
+
+    if [[ $i -eq $MAX_WAIT ]]; then
+      warn "SQL pool not ready after $((MAX_WAIT * 10))s."
+      warn "Run schema manually once the pool is online:"
+      warn "  sqlcmd -S ${SYNAPSE_WORKSPACE}.sql.azuresynapse.net -d $SYNAPSE_SQL_POOL -U sqladmin -P <from-keyvault> -i database/schema.sql -I"
+      return
+    fi
+
+    (( i % 5 == 0 )) && log "  Status: $STATUS (${i}/${MAX_WAIT} — $((i * 10))s elapsed)"
+    sleep 10
+  done
+
+  if [[ -z "$SYNAPSE_SQL_PASSWORD" ]]; then
+    warn "No SQL password available — skipping schema init."
+    warn "Retrieve it: az keyvault secret show --vault-name $KEY_VAULT_NAME --name synapse-sql-password --query value -o tsv"
+    return
   fi
 
-  (( i % 5 == 0 )) && log "  Status: $STATUS (${i}/${MAX_WAIT} — $((i * 10))s elapsed)"
-  sleep 10
-done
+  local SYNAPSE_SERVER="${SYNAPSE_WORKSPACE}.sql.azuresynapse.net"
 
-if [[ -z "$SYNAPSE_SQL_PASSWORD" ]]; then
-  warn "No SQL password available — skipping schema init."
-  warn "Retrieve it: az keyvault secret show --vault-name $KEY_VAULT_NAME --name synapse-sql-password --query value -o tsv"
-  exit 0
-fi
-
-SYNAPSE_SERVER="${SYNAPSE_WORKSPACE}.sql.azuresynapse.net"
-
-if command -v sqlcmd >/dev/null 2>&1; then
-  log "Running schema initialization against $SYNAPSE_SERVER..."
-  sqlcmd \
-    -S "$SYNAPSE_SERVER" \
-    -d "$SYNAPSE_SQL_POOL" \
-    -U "sqladmin" \
-    -P "$SYNAPSE_SQL_PASSWORD" \
-    -i "$ROOT_DIR/database/schema.sql" \
-    -I -C 2>&1 || warn "Schema may already exist — this is OK on re-provision."
-  success "Database schema initialized"
-elif command -v docker >/dev/null 2>&1; then
-  # Fallback: run sqlcmd via the official Microsoft Docker image (no local install needed)
-  log "sqlcmd not found locally — running schema init via Docker (mcr.microsoft.com/mssql-tools)..."
-  docker run --rm --platform linux/amd64 \
-    -v "$ROOT_DIR/database:/database:ro" \
-    mcr.microsoft.com/mssql-tools \
-    /opt/mssql-tools/bin/sqlcmd \
+  if command -v sqlcmd >/dev/null 2>&1; then
+    log "Running schema initialization against $SYNAPSE_SERVER..."
+    sqlcmd \
       -S "$SYNAPSE_SERVER" \
       -d "$SYNAPSE_SQL_POOL" \
       -U "sqladmin" \
       -P "$SYNAPSE_SQL_PASSWORD" \
-      -i "/database/schema.sql" \
+      -i "$ROOT_DIR/database/schema.sql" \
       -I -C 2>&1 || warn "Schema may already exist — this is OK on re-provision."
-  success "Database schema initialized (via Docker)"
-else
-  warn "sqlcmd not found and Docker is not available."
-  warn "Install mssql-tools18 or run the schema manually:"
-  warn ""
-  warn "  Option 1 — Docker (recommended):"
-  warn "    docker run --rm -v \"\$(pwd)/database:/database\" mcr.microsoft.com/mssql-tools \\"
-  warn "      /opt/mssql-tools/bin/sqlcmd -S $SYNAPSE_SERVER -d $SYNAPSE_SQL_POOL \\"
-  warn "      -U sqladmin -P '<password>' -i /database/schema.sql -I"
-  warn ""
-  warn "  Option 2 — sqlcmd directly:"
-  warn "    sqlcmd -S $SYNAPSE_SERVER -d $SYNAPSE_SQL_POOL -U sqladmin -P '<password>' -i database/schema.sql -I"
-  warn ""
-  warn "  Get the password:"
-  warn "    az keyvault secret show --vault-name $KEY_VAULT_NAME --name synapse-sql-password --query value -o tsv"
-fi
+    success "Database schema initialized"
+  elif command -v docker >/dev/null 2>&1; then
+    log "sqlcmd not found locally — running schema init via Docker (mcr.microsoft.com/mssql-tools)..."
+    docker run --rm --platform linux/amd64 \
+      -v "$ROOT_DIR/database:/database:ro" \
+      mcr.microsoft.com/mssql-tools \
+      /opt/mssql-tools/bin/sqlcmd \
+        -S "$SYNAPSE_SERVER" \
+        -d "$SYNAPSE_SQL_POOL" \
+        -U "sqladmin" \
+        -P "$SYNAPSE_SQL_PASSWORD" \
+        -i "/database/schema.sql" \
+        -I -C 2>&1 || warn "Schema may already exist — this is OK on re-provision."
+    success "Database schema initialized (via Docker)"
+  else
+    warn "sqlcmd not found and Docker is not available."
+    warn "Install mssql-tools18 or run the schema manually:"
+    warn ""
+    warn "  Option 1 — Docker (recommended):"
+    warn "    docker run --rm -v \"\$(pwd)/database:/database\" mcr.microsoft.com/mssql-tools \\"
+    warn "      /opt/mssql-tools/bin/sqlcmd -S $SYNAPSE_SERVER -d $SYNAPSE_SQL_POOL \\"
+    warn "      -U sqladmin -P '<password>' -i /database/schema.sql -I"
+    warn ""
+    warn "  Option 2 — sqlcmd directly:"
+    warn "    sqlcmd -S $SYNAPSE_SERVER -d $SYNAPSE_SQL_POOL -U sqladmin -P '<password>' -i database/schema.sql -I"
+    warn ""
+    warn "  Get the password:"
+    warn "    az keyvault secret show --vault-name $KEY_VAULT_NAME --name synapse-sql-password --query value -o tsv"
+  fi
+}
+
+init_schema
+
+# =============================================================================
+# STEP 4: Upload profile_data reference frames to blob storage
+# Uploads all *.jpg files from profile_data/ into the video-frames container
+# under the profile-reference/ prefix so the func container can use them
+# when REFERENCE_FRAMES_MODE=true.
+# =============================================================================
+upload_reference_frames() {
+  local profile_dir="$ROOT_DIR/profile_data"
+
+  if [[ ! -d "$profile_dir" ]]; then
+    warn "profile_data/ directory not found — skipping reference frame upload."
+    return
+  fi
+
+  # Count eligible image files
+  local frame_count
+  frame_count=$(find "$profile_dir" -maxdepth 1 -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" 2>/dev/null | wc -l | tr -d ' ')
+
+  if [[ "$frame_count" -eq 0 ]]; then
+    warn "No image files found in profile_data/ — skipping reference frame upload."
+    return
+  fi
+
+  if [[ -z "$STORAGE_ACCOUNT_NAME" ]]; then
+    warn "Storage account name not available — skipping reference frame upload."
+    warn "Upload manually with:"
+    warn "  az storage blob upload-batch --account-name <name> \\"
+    warn "    --destination video-frames/profile-reference \\"
+    warn "    --source profile_data --pattern '*.jpg'"
+    return
+  fi
+
+  log "Uploading $frame_count reference frames from profile_data/ to blob storage..."
+  log "  Storage account : $STORAGE_ACCOUNT_NAME"
+  log "  Container/prefix: video-frames/profile-reference/"
+
+  az storage blob upload-batch \
+    --account-name "$STORAGE_ACCOUNT_NAME" \
+    --destination "video-frames" \
+    --destination-path "profile-reference" \
+    --source "$profile_dir" \
+    --pattern "*.jpg" \
+    --overwrite true \
+    --auth-mode login \
+    --output none 2>&1 && UPLOAD_EXIT=0 || UPLOAD_EXIT=$?
+
+  # Also upload .jpeg and .png if present
+  az storage blob upload-batch \
+    --account-name "$STORAGE_ACCOUNT_NAME" \
+    --destination "video-frames" \
+    --destination-path "profile-reference" \
+    --source "$profile_dir" \
+    --pattern "*.jpeg" \
+    --overwrite true \
+    --auth-mode login \
+    --output none 2>/dev/null || true
+
+  az storage blob upload-batch \
+    --account-name "$STORAGE_ACCOUNT_NAME" \
+    --destination "video-frames" \
+    --destination-path "profile-reference" \
+    --source "$profile_dir" \
+    --pattern "*.png" \
+    --overwrite true \
+    --auth-mode login \
+    --output none 2>/dev/null || true
+
+  if [[ "${UPLOAD_EXIT:-0}" -eq 0 ]]; then
+    success "Uploaded $frame_count reference frames to video-frames/profile-reference/"
+    success "To enable reference frames mode, set REFERENCE_FRAMES_MODE=true on the func container app:"
+    success "  az containerapp update --resource-group $RESOURCE_GROUP \\"
+    success "    --name func-<suffix> --set-env-vars REFERENCE_FRAMES_MODE=true"
+  else
+    warn "Reference frame upload encountered errors (non-fatal)."
+    warn "Upload manually with:"
+    warn "  az storage blob upload-batch --account-name $STORAGE_ACCOUNT_NAME \\"
+    warn "    --destination video-frames --destination-path profile-reference \\"
+    warn "    --source profile_data --pattern '*.jpg' --auth-mode login"
+  fi
+}
+
+upload_reference_frames
 
 echo ""
 success "Post-provision complete!"

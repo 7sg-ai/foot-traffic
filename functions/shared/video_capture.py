@@ -187,6 +187,14 @@ class VideoCapture:
         """
         Capture multiple frames from a video feed.
 
+        Reference frames mode
+        ---------------------
+        When REFERENCE_FRAMES_MODE=true, live video capture is skipped entirely.
+        Instead, frames are loaded from the ``profile-reference/`` folder in the
+        video-frames blob container (uploaded during deployment from profile_data/).
+        This is useful for profiling / testing the VLM pipeline without consuming
+        live camera bandwidth or requiring network access to the camera feeds.
+
         TfL JamCam strategy
         -------------------
         The feed_url points to a short MP4 clip (~5-10 s) on S3 that TfL
@@ -210,6 +218,14 @@ class VideoCapture:
             List of (jpeg_bytes, blob_url) tuples
         """
         frames_out: list[tuple[bytes, str]] = []
+
+        # ---- Reference frames mode ----------------------------------
+        if self._settings.reference_frames_mode:
+            return self._capture_reference_frames(
+                feed_id=feed_id,
+                interval_start=interval_start,
+                num_frames=num_frames,
+            )
 
         # ---- TfL JamCam path ----------------------------------------
         if self._is_tfl_jamcam(feed_url):
@@ -271,6 +287,76 @@ class VideoCapture:
             num_frames,
             feed_id,
             interval_start.isoformat(),
+        )
+        return frames_out
+
+    def _capture_reference_frames(
+        self,
+        feed_id: int,
+        interval_start: datetime,
+        num_frames: int,
+    ) -> list[tuple[bytes, str]]:
+        """
+        Load pre-uploaded reference frames from blob storage instead of capturing
+        live video.  Frames are read from the ``profile-reference/`` prefix in the
+        video-frames container (populated during deployment from profile_data/).
+
+        Up to *num_frames* blobs are selected at random from the reference pool so
+        that each scheduler run sees a varied sample.  The selected blobs are then
+        re-uploaded under the normal live-capture path so the rest of the pipeline
+        (VLM analysis, DB writes) is completely unchanged.
+        """
+        import random
+
+        prefix = self._settings.reference_frames_prefix
+        logger.info(
+            "Reference frames mode: loading up to %d frames from blob prefix '%s' for feed_id=%d",
+            num_frames, prefix, feed_id,
+        )
+
+        try:
+            container_client = self._blob_client.get_container_client(self._container)
+            all_blobs = [
+                b.name
+                for b in container_client.list_blobs(name_starts_with=prefix)
+                if b.name.lower().endswith((".jpg", ".jpeg", ".png"))
+            ]
+        except Exception as e:
+            logger.error("Failed to list reference blobs under '%s': %s", prefix, e)
+            return []
+
+        if not all_blobs:
+            logger.warning("No reference frames found under prefix '%s'", prefix)
+            return []
+
+        # Pick a random sample (with replacement if pool is smaller than num_frames)
+        selected = random.choices(all_blobs, k=num_frames) if len(all_blobs) < num_frames \
+            else random.sample(all_blobs, num_frames)
+
+        frames_out: list[tuple[bytes, str]] = []
+        for i, blob_name in enumerate(selected):
+            try:
+                blob_client = container_client.get_blob_client(blob_name)
+                jpeg_bytes = blob_client.download_blob().readall()
+
+                # Re-upload under the standard live-capture path so downstream
+                # code (VLM analyzer, DB writes) sees a normal blob URL.
+                blob_url = self._upload_frame(
+                    jpeg_bytes=jpeg_bytes,
+                    feed_id=feed_id,
+                    interval_start=interval_start,
+                    frame_index=i,
+                )
+                frames_out.append((jpeg_bytes, blob_url))
+                logger.debug(
+                    "Reference frame %d/%d: %s → %s", i + 1, num_frames, blob_name, blob_url
+                )
+            except Exception as e:
+                logger.warning("Failed to load reference blob '%s': %s", blob_name, e)
+
+        logger.info(
+            "Loaded %d/%d reference frames for feed_id=%d interval=%s",
+            len(frames_out), num_frames, feed_id, interval_start.isoformat(),
         )
         return frames_out
 

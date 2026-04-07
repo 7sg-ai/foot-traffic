@@ -369,6 +369,11 @@ resource functionsContainerApp 'Microsoft.App/containerApps@2023-05-01' = {
             { name: 'AzureWebJobsStorage',              secretRef: 'storage-connection-string' }
             { name: 'FUNCTIONS_EXTENSION_VERSION',      value: '~4' }
             { name: 'FUNCTIONS_WORKER_RUNTIME',         value: 'python' }
+            // Force the Functions host (ASP.NET Core) to bind on port 80.
+            // Without this the host picks a random ephemeral port, causing
+            // Container Apps startup probes to fail (PortMismatch warning).
+            { name: 'ASPNETCORE_URLS',                  value: 'http://+:80' }
+            { name: 'WEBSITES_PORT',                    value: '80' }
             // Azure OpenAI
             { name: 'AZURE_OPENAI_ENDPOINT',    value: openAiAccount.properties.endpoint }
             { name: 'AZURE_OPENAI_API_KEY',     secretRef: 'openai-api-key' }
@@ -386,6 +391,12 @@ resource functionsContainerApp 'Microsoft.App/containerApps@2023-05-01' = {
             { name: 'SYNAPSE_PASSWORD', secretRef: 'synapse-password' }
             // Key Vault URI
             { name: 'KEY_VAULT_URI', value: keyVault.properties.vaultUri }
+            // Reference frames mode
+            // Set REFERENCE_FRAMES_MODE=true to process pre-uploaded profile_data frames
+            // instead of capturing live video. Frames must be uploaded to the
+            // profile-reference/ prefix in the video-frames container (done by postprovision.sh).
+            { name: 'REFERENCE_FRAMES_MODE',   value: 'false' }
+            { name: 'REFERENCE_FRAMES_PREFIX', value: 'profile-reference/' }
           ]
         }
       ]

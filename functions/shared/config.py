@@ -42,6 +42,17 @@ class Settings:
         default_factory=lambda: float(os.environ.get("CONFIDENCE_THRESHOLD", "0.6"))
     )
 
+    # Reference frames mode
+    # When True, the video scheduler skips live video capture and instead
+    # processes pre-uploaded reference frames from blob storage.
+    reference_frames_mode: bool = field(
+        default_factory=lambda: os.environ.get("REFERENCE_FRAMES_MODE", "false").lower() == "true"
+    )
+    # Blob prefix (folder) inside the video-frames container where reference frames are stored.
+    reference_frames_prefix: str = field(
+        default_factory=lambda: os.environ.get("REFERENCE_FRAMES_PREFIX", "profile-reference/")
+    )
+
     @property
     def synapse_connection_string(self) -> str:
         """Build ODBC connection string for Synapse."""

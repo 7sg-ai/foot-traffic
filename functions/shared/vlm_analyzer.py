@@ -26,6 +26,9 @@ from .models import PersonObservation, FrameAnalysisResult
 
 logger = logging.getLogger(__name__)
 
+# Blob name used for VLM analysis debug logging (mirrors capture-status.log pattern)
+VLM_LOG_BLOB = "vlm-analysis.log"
+
 # Model version reference (for documentation / alerting purposes)
 # gpt-5.3-chat (2025-02-01): vision-capable (text + image)
 # Used in place of gpt-5.4 which is restricted in this subscription
@@ -114,6 +117,47 @@ class VLMAnalyzer:
         # Lifetime cumulative counter — use tokens_this_call on FrameAnalysisResult
         # for per-job accounting instead of reading this directly.
         self._total_tokens_used = 0
+        # Blob client for status logging — initialised lazily
+        self._blob_client = None
+
+    def _get_blob_client(self):
+        """Return (and lazily create) the BlobServiceClient for status logging."""
+        if self._blob_client is None:
+            try:
+                from azure.storage.blob import BlobServiceClient
+                self._blob_client = BlobServiceClient.from_connection_string(
+                    self._settings.storage_connection_string
+                )
+            except Exception as e:
+                logger.warning("VLM blob logger: could not create BlobServiceClient: %s", e)
+        return self._blob_client
+
+    def _write_status_blob(self, msg: str) -> None:
+        """Append a timestamped status message to vlm-analysis.log in blob storage.
+
+        Mirrors the capture-status.log pattern used by VideoCapture so that
+        VLM execution details (persons detected, tokens, raw responses, errors)
+        are persisted and inspectable outside the container's live log stream.
+        """
+        try:
+            import datetime as _dt
+            ts = _dt.datetime.utcnow().isoformat()
+            blob_client_svc = self._get_blob_client()
+            if blob_client_svc is None:
+                return
+            container = self._settings.frames_container
+            existing = ""
+            try:
+                blob = blob_client_svc.get_blob_client(container, VLM_LOG_BLOB)
+                existing = blob.download_blob().readall().decode()
+            except Exception:
+                pass
+            content = existing + f"\n[{ts}] {msg}"
+            blob = blob_client_svc.get_blob_client(container, VLM_LOG_BLOB)
+            blob.upload_blob(content.encode(), overwrite=True)
+        except Exception as e:
+            # Non-fatal: never let logging break the analysis pipeline
+            logger.debug("VLM blob logger write failed: %s", e)
 
     def _get_client(self) -> AzureOpenAI:
         """Return (and lazily create) the AzureOpenAI client."""
@@ -182,6 +226,11 @@ class VLMAnalyzer:
             model_version=self._deployment,
         )
 
+        self._write_status_blob(
+            f"vlm: START feed_id={feed_id} frame={frame_blob_url or 'no-url'} "
+            f"image_bytes={len(image_bytes)} interval={interval_start}"
+        )
+
         try:
             b64_image = self.encode_image_bytes(image_bytes)
 
@@ -211,13 +260,15 @@ class VLMAnalyzer:
                     },
                 ],
                 response_format={"type": "json_object"},
-                max_tokens=4096,
-                temperature=0.1,  # Low temperature for consistent categorization
+                max_completion_tokens=4096,
+                # temperature not set — gpt-5.3-chat only supports default (1)
             )
 
             # Track token usage — store on the result so callers can sum per-job
             # totals without relying on the singleton's lifetime counter.
             tokens_this_call = response.usage.total_tokens if response.usage else 0
+            prompt_tokens = response.usage.prompt_tokens if response.usage else 0
+            completion_tokens = response.usage.completion_tokens if response.usage else 0
             if tokens_this_call == 0:
                 # usage can be None or zero for some Azure OpenAI API versions;
                 # log so we can detect the issue without silently dropping counts.
@@ -226,11 +277,23 @@ class VLMAnalyzer:
                     response.usage,
                     feed_id,
                 )
+                self._write_status_blob(
+                    f"vlm: WARN feed_id={feed_id} response.usage={response.usage} "
+                    f"finish_reason={response.choices[0].finish_reason if response.choices else 'none'}"
+                )
             self._total_tokens_used += tokens_this_call
             result.tokens_this_call = tokens_this_call
 
             raw_response = response.choices[0].message.content
             result.vlm_raw_response = raw_response
+
+            self._write_status_blob(
+                f"vlm: RESPONSE feed_id={feed_id} "
+                f"tokens={tokens_this_call} (prompt={prompt_tokens} completion={completion_tokens}) "
+                f"finish_reason={response.choices[0].finish_reason} "
+                f"raw_len={len(raw_response or '')} "
+                f"raw={repr((raw_response or '')[:500])}"
+            )
 
             # Parse the JSON response
             parsed = json.loads(raw_response)
@@ -272,12 +335,28 @@ class VLMAnalyzer:
                     feed_id,
                     raw_response,
                 )
+                self._write_status_blob(
+                    f"vlm: ZERO_PERSONS feed_id={feed_id} "
+                    f"scene={result.scene_description!r} "
+                    f"crowd_density={result.crowd_density!r} "
+                    f"time_of_day={result.time_of_day!r} "
+                    f"weather={result.weather_conditions!r} "
+                    f"tokens={tokens_this_call} "
+                    f"frame={frame_blob_url or 'no-url'}"
+                )
             else:
                 logger.info(
                     "VLM analysis complete: feed_id=%d, persons=%d, tokens=%d",
                     feed_id,
                     len(persons),
                     tokens_this_call,
+                )
+                self._write_status_blob(
+                    f"vlm: OK feed_id={feed_id} persons={len(persons)} "
+                    f"tokens={tokens_this_call} "
+                    f"scene={result.scene_description!r} "
+                    f"crowd_density={result.crowd_density!r} "
+                    f"frame={frame_blob_url or 'no-url'}"
                 )
 
         except json.JSONDecodeError as e:
@@ -288,13 +367,26 @@ class VLMAnalyzer:
                 result.vlm_raw_response or "<no response captured>",
             )
             result.error = f"JSON parse error: {e}"
+            self._write_status_blob(
+                f"vlm: JSON_ERROR feed_id={feed_id} error={e} "
+                f"raw={repr((result.vlm_raw_response or '')[:500])}"
+            )
         except Exception as e:
             logger.error("VLM analysis failed: %s", e)
             result.error = str(e)
+            self._write_status_blob(
+                f"vlm: EXCEPTION feed_id={feed_id} error={type(e).__name__}: {e}"
+            )
             raise  # Re-raise for retry logic
 
         finally:
             result.processing_duration_ms = int((time.time() - start_time) * 1000)
+            self._write_status_blob(
+                f"vlm: DONE feed_id={feed_id} "
+                f"duration_ms={result.processing_duration_ms} "
+                f"persons={len(result.persons) if result.persons else 0} "
+                f"error={result.error or 'none'}"
+            )
 
         return result
 
@@ -323,6 +415,10 @@ class VLMAnalyzer:
         interval_duration = timedelta(minutes=5)
         frame_count = len(frames)
 
+        self._write_status_blob(
+            f"vlm: INTERVAL_START feed_id={feed_id} frames={frame_count} interval={interval_start}"
+        )
+
         for i, (image_bytes, blob_url) in enumerate(frames):
             # Distribute frame timestamps evenly across the interval
             offset_seconds = (interval_duration.total_seconds() / max(frame_count, 1)) * i
@@ -341,6 +437,10 @@ class VLMAnalyzer:
                 results.append(result)
             except Exception as e:
                 logger.error("Frame %d/%d analysis failed: %s", i + 1, frame_count, e)
+                self._write_status_blob(
+                    f"vlm: FRAME_EXCEPTION feed_id={feed_id} frame={i+1}/{frame_count} "
+                    f"error={type(e).__name__}: {e}"
+                )
                 # Add error result so we track the failure
                 results.append(FrameAnalysisResult(
                     feed_id=feed_id,
@@ -350,6 +450,14 @@ class VLMAnalyzer:
                     frame_blob_url=blob_url,
                     error=str(e),
                 ))
+
+        total_persons = sum(len(r.persons) for r in results if r.persons)
+        total_tokens = sum(r.tokens_this_call for r in results)
+        error_count = sum(1 for r in results if r.error)
+        self._write_status_blob(
+            f"vlm: INTERVAL_DONE feed_id={feed_id} interval={interval_start} "
+            f"frames={frame_count} persons={total_persons} tokens={total_tokens} errors={error_count}"
+        )
 
         return results
 
